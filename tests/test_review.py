@@ -117,7 +117,8 @@ class GateTests(unittest.TestCase):
         rundir.mkdir()
         (rundir / "plan.md").write_text("- [x] step\n")
         self.run = SimpleNamespace(
-            worktree=root, objective="o", review_round=0, interrupted=False,
+            worktree=root, objective="o", review_round=0, review_coverage={},
+            interrupted=False,
             config={"review": {"max_rounds": 2, "every": 0, "personas": [], "models": {}}},
             rundir=SimpleNamespace(path=rundir, base_commit=base, plan_path=rundir / "plan.md",
                                    read_plan=lambda: (rundir / "plan.md").read_text()),
@@ -134,13 +135,15 @@ class GateTests(unittest.TestCase):
 
     def test_approved(self):
         self.assertEqual(self.gate([("APPROVED", [])]), "")
+        self.assertEqual(self.run.review_coverage, {"correctness": "APPROVED"})
 
     def test_changes_become_plan_items_then_rounds_run_out(self):
         self.assertEqual(self.gate([("CHANGES_REQUESTED", ["[a.py:1] use 3"])]), "changes")
         self.assertIn("- [ ] [a.py:1] use 3 (review r1/correctness)", self.run.rundir.read_plan())
         self.assertEqual(self.gate([("", [])]), "changes")           # no verdict
         self.assertIn("produced no verdict", self.run.rundir.read_plan())
-        self.assertEqual(self.gate([]), " (review unresolved)")      # max_rounds = 2
+        self.assertEqual(self.gate([]),
+                         " (review unresolved; correctness never got a verdict")
 
     def test_later_personas_still_review_after_changes(self):
         (self.run.worktree / "a.css").write_text("a{}\n")
@@ -155,6 +158,34 @@ class GateTests(unittest.TestCase):
     def test_off(self):
         self.run.config["review"]["max_rounds"] = 0
         self.assertEqual(self.gate([]), " (review off)")
+
+    def test_exhaustion_names_personas_without_verdicts(self):
+        # The slots failure: the diff touches CSS, so design is selected,
+        # but the reviewer never returns a verdict.  Exhaustion must name
+        # every persona that was never reviewed, not just "review unresolved".
+        (self.run.worktree / "a.css").write_text("a{}\n")
+        git(self.run.worktree, "add", "-A")
+        git(self.run.worktree, "commit", "-qm", "css")
+        self.assertEqual(self.gate([("", []), ("", [])]), "changes")
+        self.assertEqual(self.gate([("", []), ("", [])]), "changes")
+        self.assertEqual(self.gate([]),
+                         " (review unresolved; correctness and design never got a verdict")
+        self.assertEqual(self.run.review_coverage,
+                         {"correctness": "no verdict", "design": "no verdict"})
+
+    def test_exhaustion_after_verdicts_is_bare_unresolved(self):
+        (self.run.worktree / "a.css").write_text("a{}\n")
+        git(self.run.worktree, "add", "-A")
+        git(self.run.worktree, "commit", "-qm", "css")
+        self.assertEqual(self.gate([("CHANGES_REQUESTED", ["fix x"]), ("APPROVED", [])]),
+                         "changes")
+        self.assertEqual(self.gate([("CHANGES_REQUESTED", ["fix x"]), ("APPROVED", [])]),
+                         "changes")
+        # Both personas did get verdicts; the operator sees the bare flag and
+        # the findings, not a false "never got a verdict".
+        self.assertEqual(self.gate([]), " (review unresolved)")
+        self.assertEqual(self.run.review_coverage,
+                         {"correctness": "CHANGES_REQUESTED", "design": "APPROVED"})
 
 
 class ApprovalTests(unittest.TestCase):

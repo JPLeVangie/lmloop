@@ -82,6 +82,11 @@ class Run:
         # closed when the operator approves (web/service.py `approval`).
         self.issue = issue
         self.review_round = 0
+        # Per-persona review coverage: each persona's most recent verdict.
+        # A persona that never returned a verdict in any round is named in
+        # the stop reason when the rounds run out, so awaiting approval
+        # never hides an unreviewed part of the change.
+        self.review_coverage = {}
         # Two numbers, not one.  The floor is what the operator asked for and is
         # always honoured; the ceiling is what no plan can argue past.  An
         # explicit `--max-iterations` raises the floor rather than pinning the
@@ -323,6 +328,10 @@ class Run:
             state = self.rundir.read_run_state()
             self.issue = self.issue or str(state.get("issue", ""))
             self.review_round = int(state.get("review_round", 0))
+            saved = state.get("review_coverage")
+            self.review_coverage = (
+                {str(k): v for k, v in saved.items() if isinstance(v, str)}
+                if isinstance(saved, dict) else {})
             self.pending_iteration = int(state.get("pending_iteration", 0))
             if self.pending_iteration:
                 # A provider outage writes the prompt before the request fails.  It
@@ -1226,6 +1235,7 @@ class Run:
             "pending_iteration": self.pending_iteration,
             "issue": self.issue,
             "review_round": self.review_round,
+            "review_coverage": self.review_coverage,
             "review": self.config["review"],
             # Policy state that needs to be restored on resume for semantic continuity
             "repo_path": str(self.repo),
@@ -1421,29 +1431,40 @@ class Run:
     def _review_gate(self) -> str:
         """Review a completed plan.  "changes" to keep working, else a suffix
         for the stop reason: "" when approved, " (review unresolved)" when the
-        rounds ran out, " (review off)" when disabled."""
+        rounds ran out, " (review off)" when disabled.
+
+        Coverage is tracked per persona across rounds; when the rounds run
+        out, a persona that never returned a verdict is named in the stop
+        reason, so an awaiting-approval run shows what was never reviewed."""
         settings = self.config["review"]
         if settings["max_rounds"] <= 0:
             return " (review off)"
-        if self.review_round >= settings["max_rounds"]:
-            return " (review unresolved)"
-        self.review_round += 1
-        self._save_run_state()
         base = self.rundir.base_commit
         diff = gitops.git(["diff", f"{base}...HEAD"], self.worktree, check=False)
         changed = gitops.git(["diff", "--name-only", f"{base}...HEAD"],
                              self.worktree, check=False).splitlines()
         chosen = review.select(changed, self.objective, self.rundir.read_plan(),
                                diff, settings["personas"])
+        if self.review_round >= settings["max_rounds"]:
+            never = [name for name, _ in chosen
+                     if self.review_coverage.get(name) in (None, "no verdict")]
+            suffix = " (review unresolved)"
+            if never:
+                suffix += f"; {' and '.join(never)} never got a verdict"
+            return suffix
+        self.review_round += 1
+        self._save_run_state()
         # Every persona reviews every round.  Stopping at the first objection
         # starved design: correctness always found something, rounds ran out.
         changes = ""
         for name, why in chosen:
             verdict, findings = self._review_once(f"r{self.review_round}", name, why, diff)
+            self.review_coverage[name] = verdict or "no verdict"
             if verdict != "APPROVED":
                 self._add_findings(f"review r{self.review_round}/{name}", findings or [
                     f"{name} reviewer produced no verdict; re-check the work against the objective"])
                 changes = "changes"
+        self._save_run_state()
         return changes
 
     def _drift_check(self, iteration: int) -> None:

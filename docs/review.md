@@ -62,7 +62,10 @@ Rules the harness enforces, not the prompt:
 - **Bounded.** After `max_review_rounds` (default 2) rounds that still request
   changes, the run goes to awaiting approval anyway, flagged
   "review unresolved", with the last findings shown. The operator decides;
-  two local models do not argue all night.
+  two local models do not argue all night. A persona that never returned a
+  verdict in any round is named in the flag (`...; design never got a
+  verdict`): a missing verdict is not a review, so an awaiting-approval run
+  shows exactly what was never reviewed.
 
 ## Personas
 
