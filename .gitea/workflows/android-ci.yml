@@ -1,0 +1,40 @@
+name: Android CI
+on:
+  pull_request:
+    paths: ['android/**', '.gitea/workflows/android-ci.yml']
+  push:
+    branches: [main]
+    paths: ['android/**', '.gitea/workflows/android-ci.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: android-36
+    timeout-minutes: 40
+    defaults:
+      run:
+        working-directory: android
+    steps:
+      - uses: builtin:checkout
+      - name: Verify toolchain and run tests, lint and debug build
+        run: |
+          set -eu
+          java -version
+          node --version
+          ./gradlew --no-daemon testDebugUnitTest lintDebug assembleDebug
+      - uses: https://github.com/actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: lmloop-android-debug
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+      - uses: https://github.com/actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: lmloop-android-reports
+          path: |
+            android/app/build/reports/tests/
+            android/app/build/test-results/
+            android/app/build/reports/lint-results-debug.*
+          if-no-files-found: warn
