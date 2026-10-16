@@ -65,10 +65,10 @@ and the change guard read.
 ## Install
 
 lmloop is not published on PyPI. Install the dashboard-capable command directly
-from GitHub:
+from Gitea:
 
 ```bash
-pipx install 'lmloop[web] @ git+https://github.com/jlevangi/lmloop.git'
+pipx install 'lmloop[web] @ git+https://git.levangie.dev/Pierce/lmloop.git'
 lmloop init                    # writes ~/.config/lmloop/config.toml
 lmloop doctor                  # says what is still missing
 ```
@@ -77,8 +77,8 @@ Or clone it for development. Running directly keeps the dependency-free core;
 an editable `.[web]` install adds OIDC and optional Web Push support:
 
 ```bash
-git clone https://github.com/jlevangi/lmloop.git ~/git/lmloop
-cd ~/git/lmloop
+git clone https://git.levangie.dev/Pierce/lmloop.git ~/gitea/pierce/lmloop
+cd ~/gitea/pierce/lmloop
 python3 lmloop.py doctor
 python3 -m venv .venv
 . .venv/bin/activate
@@ -241,7 +241,7 @@ tracking in the status bar/lock screen, plus background polling for finished run
 
 Install and update via [Obtainium](https://github.com/ImranR98/Obtainium):
 
-### Gitea (preferred)
+### Gitea
 
 1. Add App URL: `https://git.levangie.dev/Pierce/lmloop`
 2. Override Source: Select `Forgejo (Codeberg)`
@@ -250,13 +250,6 @@ Install and update via [Obtainium](https://github.com/ImranR98/Obtainium):
 
 To switch an existing install from GitHub, edit the app source in Obtainium rather than uninstalling or clearing data. Updates require matching package signatures and a nondecreasing version code.
 
-### GitHub (alternative)
-
-1. Add App URL: `https://github.com/jlevangi/lmloop`
-2. If the repository is private, configure a GitHub personal access token with `repo` scope under Obtainium settings.
-3. Set **Release tag filter** to `^android-v`.
-
-GitHub availability is unverified due to upstream account status.
 
 ## Checks
 

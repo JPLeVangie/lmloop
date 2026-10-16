@@ -7,7 +7,7 @@ a foreground-service "live activity" style notification while a run is
 being watched, and a background check for finished runs while the app is
 fully closed (WorkManager, not Firebase -- see the project epic for why).
 
-Modeled on `~/git/jlevangi/personal-health-collector`'s Gradle/signing/CI
+Modeled on `personal-health-collector`'s Gradle/signing/CI
 setup: same Kotlin DSL, same env-var-driven release signing, same release
 workflow shape.
 
@@ -69,10 +69,9 @@ Keep `lmloop-android-release.jks` somewhere durable and *off* this repo --
 `.gitignore` already excludes `*.jks`. Losing it is unrecoverable; back it up
 before anything else.
 
-## GitHub Actions setup
+## Gitea Actions setup
 
-Add these four repository secrets (Settings → Secrets and variables →
-Actions):
+Add these four repository secrets (repo → Settings → Actions → Secrets):
 
 | Secret | Value |
 |---|---|
@@ -84,7 +83,7 @@ Actions):
 `android-ci.yml` runs on PRs and pushes to `main` that touch `android/**`
 and needs no secrets. `android-release.yml` triggers on tags matching `android-v*`
 (strict `android-vMAJOR.MINOR.PATCH`) and publishes a signed, verified APK
-plus checksum as a GitHub Release:
+plus checksum as a Gitea release:
 
 ```sh
 git tag android-v1.0.0
@@ -95,20 +94,13 @@ git push origin android-v1.0.0
 
 Install and update the app using [Obtainium](https://github.com/ImranR98/Obtainium).
 
-### Gitea (preferred)
+### Gitea
 
 1. Add App URL: `https://git.levangie.dev/Pierce/lmloop`
 2. Override Source: Select `Forgejo (Codeberg)`
 3. Enter a token from a read-only Obtainium bot account into the **ForgeJo access token** field. Never embed secrets in repository URLs or exported configuration.
 4. Set **Release tag filter** to `^android-v`.
 
-### GitHub (alternative)
-
-1. Add App URL: `https://github.com/jlevangi/lmloop`
-2. If the repository is private, set a GitHub personal access token with `repo` scope under Obtainium Settings.
-3. Set **Release tag filter** to `^android-v`.
-
-GitHub is retained as an alternative source; its availability is unverified because of upstream account status.
 
 ### Updates and migrations
 
