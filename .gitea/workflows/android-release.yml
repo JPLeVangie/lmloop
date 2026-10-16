@@ -1,0 +1,72 @@
+name: Android signed release
+
+# Distinct `android-v*` tag namespace: Obtainium filters on this prefix
+# (see android/README.md). Tags are pushed only by repo writers, so the
+# signing secrets never reach pull-request code.
+on:
+  push:
+    tags: ['android-v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: android-36
+    timeout-minutes: 40
+    defaults:
+      run:
+        shell: bash
+        working-directory: android
+    steps:
+      - uses: builtin:checkout
+      - name: Validate tag and derive Android metadata
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_REF_NAME" =~ ^android-v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || { echo 'Tag must match strict android-vMAJOR.MINOR.PATCH' >&2; exit 1; }
+          major="${BASH_REMATCH[1]}"; minor="${BASH_REMATCH[2]}"; patch="${BASH_REMATCH[3]}"
+          [[ ${#major} -lt 4 || ( ${#major} -eq 4 && "$major" < "2148" ) ]] || { echo 'Major tag component exceeds range' >&2; exit 1; }
+          [[ ${#minor} -le 3 ]] || { echo 'Minor tag component exceeds range' >&2; exit 1; }
+          [[ ${#patch} -le 3 ]] || { echo 'Patch tag component exceeds range' >&2; exit 1; }
+          code=$((major * 1000000 + minor * 1000 + patch))
+          (( code > 0 && code <= 2147483647 )) || { echo 'Tag maps outside positive Int version-code range' >&2; exit 1; }
+          printf 'ANDROID_VERSION_NAME=%s\nANDROID_VERSION_CODE=%s\n' "${GITHUB_REF_NAME#android-v}" "$code" >> "$GITHUB_ENV"
+      - name: Test, lint, and build signed release
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          export ANDROID_KEYSTORE_PATH="$(mktemp -d)/lmloop-android-release.jks"
+          trap 'rm -f "$ANDROID_KEYSTORE_PATH"' EXIT
+          test -n "$ANDROID_KEYSTORE_BASE64" && test -n "$ANDROID_KEYSTORE_PASSWORD" && test -n "$ANDROID_KEY_ALIAS" && test -n "$ANDROID_KEY_PASSWORD"
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$ANDROID_KEYSTORE_PATH"
+          chmod 600 "$ANDROID_KEYSTORE_PATH"
+          ./gradlew --no-daemon testDebugUnitTest lintDebug assembleRelease
+      - name: Verify and package release
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#android-v}"
+          apk="lmloop-android-${version}.apk"
+          input=app/build/outputs/apk/release/app-release.apk
+          "$ANDROID_HOME/build-tools/36.0.0/apksigner" verify --print-certs "$input"
+          metadata=$("$ANDROID_HOME/build-tools/36.0.0/aapt" dump badging "$input")
+          grep -F "versionCode='${ANDROID_VERSION_CODE}' versionName='${version}'" <<< "$metadata"
+          mv "$input" "$apk"
+          sha256sum "$apk" > "lmloop-android-${version}.sha256"
+      - name: Publish Gitea release
+        env:
+          TOKEN: ${{ gitea.token }}
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#android-v}"
+          api="$GITHUB_SERVER_URL/api/v1/repos/$GITHUB_REPOSITORY/releases"
+          id=$(curl -fsS -X POST -H "Authorization: token $TOKEN" -H 'Content-Type: application/json' \
+            -d "{\"tag_name\":\"$GITHUB_REF_NAME\",\"name\":\"$GITHUB_REF_NAME\"}" "$api" \
+            | node -pe 'JSON.parse(require("fs").readFileSync(0)).id')
+          for f in "lmloop-android-${version}.apk" "lmloop-android-${version}.sha256"; do
+            curl -fsS -X POST -H "Authorization: token $TOKEN" -F "attachment=@$f" "$api/$id/assets?name=$f" >/dev/null
+          done
+          echo "Published $GITHUB_REF_NAME (release $id)"
