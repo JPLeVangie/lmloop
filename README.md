@@ -239,11 +239,24 @@ A native Android client lives in [`android/`](android/README.md). It embeds the
 dashboard PWA and adds native foreground service "Live Activity" progress
 tracking in the status bar/lock screen, plus background polling for finished runs.
 
-Install and keep it updated via [Obtainium](https://github.com/ImranR98/Obtainium):
+Install and update via [Obtainium](https://github.com/ImranR98/Obtainium):
 
-[<img src="https://raw.githubusercontent.com/ImranR98/Obtainium/main/assets/graphics/badge_obtainium.png" alt="Get it on Obtainium" height="60">](https://apps.obtainium.imranr.dev/redirect?r=obtainium://add/https://github.com/jlevangi/lmloop)
+### Gitea (preferred)
 
-Set Obtainium's **release tag filter** to `^android-v` to track Android releases.
+1. Add App URL: `https://git.levangie.dev/Pierce/lmloop`
+2. Override Source: Select `Forgejo (Codeberg)`
+3. Enter a read-only bot personal access token in the **ForgeJo access token** field. Do not embed credentials in URLs or exported configs.
+4. Set **Release tag filter** to `^android-v`.
+
+To switch an existing install from GitHub, edit the app source in Obtainium rather than uninstalling or clearing data. Updates require matching package signatures and a nondecreasing version code.
+
+### GitHub (alternative)
+
+1. Add App URL: `https://github.com/jlevangi/lmloop`
+2. If the repository is private, configure a GitHub personal access token with `repo` scope under Obtainium settings.
+3. Set **Release tag filter** to `^android-v`.
+
+GitHub availability is unverified due to upstream account status.
 
 ## Checks
 
