@@ -1,0 +1,36 @@
+name: GitHub mirror
+
+# Public read-only mirror: github.com/JPLeVangie/lmloop. Gitea stays the source of truth.
+# Pushes branches and tags only; refs/dolt/* (Beads DB) and other refs stay private.
+# SSH runs over ssh.github.com:443 because the runner egress allows only 80/443.
+on:
+  push:
+    branches: ['**']
+    tags: ['**']
+  delete:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  mirror:
+    if: gitea.repository == 'Pierce/lmloop'
+    runs-on: python-3.12
+    timeout-minutes: 10
+    steps:
+      - name: Push branches and tags to GitHub
+        env:
+          TOKEN: ${{ gitea.token }}
+          MIRROR_KEY: ${{ secrets.MIRROR_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          test -n "$MIRROR_KEY"
+          dir=$(mktemp -d); trap 'rm -rf "$dir"' EXIT
+          printf '%s\n' "$MIRROR_KEY" > "$dir/key"; chmod 600 "$dir/key"
+          # Pinned from https://api.github.com/meta (ssh_keys).
+          echo '[ssh.github.com]:443 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl' > "$dir/known_hosts"
+          export GIT_SSH_COMMAND="ssh -i $dir/key -o IdentitiesOnly=yes -o UserKnownHostsFile=$dir/known_hosts -o StrictHostKeyChecking=yes"
+          git -c http.extraHeader="Authorization: token $TOKEN" clone -q --bare "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git" "$dir/repo"
+          git -C "$dir/repo" push --prune ssh://git@ssh.github.com:443/JPLeVangie/lmloop.git \
+            '+refs/heads/*:refs/heads/*' '+refs/tags/*:refs/tags/*'

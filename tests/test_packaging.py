@@ -66,6 +66,8 @@ class BuiltInstallationTests(unittest.TestCase):
             self.assertEqual(1, len(list(artifacts.glob("*.whl"))))
             self.assertEqual(1, len(list(artifacts.glob("*.tar.gz"))))
 
+            clean_environment = {**os.environ, "PYTHONNOUSERSITE": "1"}
+            clean_environment.pop("PYTHONPATH", None)
             virtualenv = temporary / "venv"
             if uv:
                 subprocess.run(
@@ -76,6 +78,7 @@ class BuiltInstallationTests(unittest.TestCase):
                 subprocess.run(
                     [uv, "pip", "install", "--python", str(python), "--no-deps",
                      str(next(artifacts.glob("*.whl")))],
+                    cwd=temporary, env=clean_environment,
                     check=True, capture_output=True, text=True, timeout=self.TIMEOUT,
                 )
             else:
@@ -87,11 +90,10 @@ class BuiltInstallationTests(unittest.TestCase):
                 subprocess.run(
                     [str(python), "-m", "pip", "install", "--no-deps",
                      str(next(artifacts.glob("*.whl")))],
+                    cwd=temporary, env=clean_environment,
                     check=True, capture_output=True, text=True, timeout=self.TIMEOUT,
                 )
 
-            clean_environment = {**os.environ, "PYTHONNOUSERSITE": "1"}
-            clean_environment.pop("PYTHONPATH", None)
             for entry_point in ("lmloop", "lmloop-web"):
                 completed = subprocess.run(
                     [str(virtualenv / "bin" / entry_point), "--help"],
@@ -231,6 +233,9 @@ class ExampleFileTests(unittest.TestCase):
                 text = (ROOT / name).read_text(errors="ignore")
             except OSError:
                 continue
+            if name == "README.md":
+                # The documented Obtainium source is intentionally repository-specific.
+                text = re.sub(r"https://git\.levangie\.dev/Pierce/lmloop(?=[`\s)]|$)", "", text)
             found = sorted(set(self.IDENTIFYING.findall(text)))
             if found:
                 offenders[name] = found

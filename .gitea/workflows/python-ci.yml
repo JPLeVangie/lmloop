@@ -36,7 +36,7 @@ jobs:
       - name: Set job-local Git identity for repository tests
         run: |
           git config --global user.name 'CI'
-          git config --global user.email 'ci@levangie.dev'
+          git config --global user.email 'ci@example.invalid'
       - run: python -m compileall -q . web/
       - run: PYTHONPATH=. python -m unittest discover -s tests -t .
       - run: tools/smoke

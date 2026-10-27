@@ -65,10 +65,10 @@ and the change guard read.
 ## Install
 
 lmloop is not published on PyPI. Install the dashboard-capable command directly
-from Gitea:
+from the public GitHub mirror:
 
 ```bash
-pipx install 'lmloop[web] @ git+https://git.levangie.dev/Pierce/lmloop.git'
+pipx install 'lmloop[web] @ git+https://github.com/JPLeVangie/lmloop.git'
 lmloop init                    # writes ~/.config/lmloop/config.toml
 lmloop doctor                  # says what is still missing
 ```
@@ -77,8 +77,8 @@ Or clone it for development. Running directly keeps the dependency-free core;
 an editable `.[web]` install adds OIDC and optional Web Push support:
 
 ```bash
-git clone https://git.levangie.dev/Pierce/lmloop.git ~/gitea/pierce/lmloop
-cd ~/gitea/pierce/lmloop
+git clone https://github.com/JPLeVangie/lmloop.git
+cd lmloop
 python3 lmloop.py doctor
 python3 -m venv .venv
 . .venv/bin/activate

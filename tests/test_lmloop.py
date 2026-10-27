@@ -2,6 +2,7 @@ import ast
 import contextlib
 import io
 import json
+import re
 import tempfile
 import time
 import unittest
@@ -951,7 +952,8 @@ class ToolAllowlistTests(unittest.TestCase):
     def test_override_settles_the_allowlist_after_the_agent(self):
         """`--agent omp` arrives holding pi's tool names; order decides."""
         cfg = config._merge(config.DEFAULTS, {})
-        config.override_agent(cfg, "omp")
+        with mock.patch("config.shutil.which", return_value="/usr/local/bin/omp"):
+            config.override_agent(cfg, "omp")
         self.assertEqual(harness.OMP_DEFAULT_TOOLS, cfg["agent"]["tools"])
         self.assertEqual("omp", cfg["agent"]["harness"])
 
@@ -1039,7 +1041,13 @@ class TerminationTests(unittest.TestCase):
             while time.monotonic() < deadline:
                 try:
                     os.kill(child, 0)
-                except ProcessLookupError:
+                    # Container PID 1 may leave a killed grandchild unreaped.
+                    status = Path(f"/proc/{child}/status")
+                    if status.exists() and re.search(
+                        r"^State:\s+[ZX]\b", status.read_text(), re.MULTILINE
+                    ):
+                        break
+                except (ProcessLookupError, FileNotFoundError):
                     break
                 time.sleep(0.05)
             else:
