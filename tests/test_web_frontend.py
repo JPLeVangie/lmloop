@@ -415,15 +415,20 @@ class IterationClockTests(unittest.TestCase):
         self.assertIsNotNone(match, f"{name} moved or was renamed")
         return match.group(1)
 
-    def test_the_model_card_shows_the_iteration_clock_while_running(self):
-        body = self.function_body("patchModel")
-        self.assertIn("liveElapsed(run)", body)
+    def test_the_header_promotes_the_live_iteration_clock(self):
+        self.assertIn('"iteration elapsed"', APP)
+        body = self.function_body("patchHead")
+        self.assertIn("liveIterationClock(run)", body)
         self.assertIn("isWorking(run)", body)
 
+    def test_the_iteration_clock_includes_seconds(self):
+        body = self.function_body("clockDuration")
+        self.assertIn("padStart(2", body)
+        self.assertIn("% 60", body)
+
     def test_the_per_second_ticker_updates_it_without_a_full_repaint(self):
-        """Matches the row card and the runbar strip, which already tick a
-        `.clock` span every second rather than waiting for the next poll."""
-        self.assertIn('querySelector("#view-run .model-meta .clock")', APP)
+        """The prominent header figure advances between API polls."""
+        self.assertIn('head.cells["iteration elapsed"]', APP)
 
 
 class IterationDetailTests(unittest.TestCase):

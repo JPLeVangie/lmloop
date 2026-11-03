@@ -1258,7 +1258,8 @@ class Run:
                     self.pending_iteration = iteration if not self.last_commit else 0
                     self._save_run_state()
                     if not self._wait_for_server(
-                        iteration, self.last_detail or "local model provider unavailable"
+                        iteration, self.last_detail or "local model provider unavailable",
+                        retry_same=not bool(self.last_commit),
                     ):
                         reason = "local model provider unavailable; paused run was stopped"
                         break
@@ -1513,7 +1514,7 @@ class Run:
             time.sleep(1)
         return True
 
-    def _wait_for_server(self, iteration: int, detail: str) -> bool:
+    def _wait_for_server(self, iteration: int, detail: str, *, retry_same: bool = True) -> bool:
         """Pause for an absent local provider until the operator resumes the run.
 
         Only reached for a run whose model is served locally -- see `_backoff`.
@@ -1556,8 +1557,13 @@ class Run:
             self.rundir.event("provider:still-unavailable", iteration=iteration)
             return True
 
-        self.rundir.event("provider:resume", iteration=iteration, waited=round(waited))
-        self.screen.log(f"    local model provider is back; resuming iteration {iteration}")
+        next_iteration = iteration if retry_same else iteration + 1
+        self.rundir.event(
+            "provider:resume", iteration=iteration, nextIteration=next_iteration,
+            waited=round(waited),
+        )
+        action = "retrying" if retry_same else "continuing with"
+        self.screen.log(f"    local model provider is back; {action} iteration {next_iteration}")
         self._errors = 0
         return True
 

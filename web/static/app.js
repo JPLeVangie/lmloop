@@ -89,6 +89,14 @@ function duration(seconds) {
   return m < 60 ? `${m}m` : `${Math.floor(m / 60)}h${String(m % 60).padStart(2, "0")}`;
 }
 
+function clockDuration(seconds) {
+  const whole = Math.max(0, Math.floor(seconds || 0));
+  const h = Math.floor(whole / 3600);
+  const m = String(Math.floor((whole % 3600) / 60)).padStart(2, "0");
+  const s = String(whole % 60).padStart(2, "0");
+  return `${h}:${m}:${s}`;
+}
+
 const ago = (s) => (s == null ? "never" : s < 60 ? "just now" : `${duration(s)} ago`);
 
 /* Token counts run to five figures and are read on a phone. Three significant
@@ -129,6 +137,13 @@ function elideMiddle(text, head = 20, tail = 7) {
 function liveElapsed(run) {
   const drift = (Date.now() - (state.fetchedAt || Date.now())) / 1000;
   return duration(Math.round((run.elapsed_seconds || 0) + drift));
+}
+
+function liveIterationClock(run) {
+  const drift = isWorking(run)
+    ? (Date.now() - (state.fetchedAt || Date.now())) / 1000
+    : 0;
+  return clockDuration((run.elapsed_seconds || 0) + drift);
 }
 
 function elapsed(run) {
@@ -377,10 +392,10 @@ function renderFilters() {
  * the body below it is replaced.
  */
 
-// `state` used to lead this grid.  The sticky header carries it now, and two
-// copies of one word a centimetre apart is how a page starts looking unedited.
-// Four cells also divide more kindly across a phone than five did.
-const FACTS = ["plan", "commits", "iter", "updated"];
+// `state` used to lead this grid. The sticky header carries it now. Keep four
+// cells for a balanced 2×2 phone grid; the live iteration clock replaces the
+// less useful duplicate of the page's existing update-age status.
+const FACTS = ["plan", "commits", "iter", "iteration elapsed"];
 
 function makeHead() {
   const node = el("div", "live");
@@ -453,13 +468,13 @@ function patchHead(head, run) {
     plan: run.plan_total ? `${run.plan_done}/${run.plan_total}` : "—",
     commits: String(run.commits),
     iter: `${run.iteration ?? "?"}/${run.max_iterations ?? "?"}`,
-    updated: ago(run.age_seconds),
+    "iteration elapsed": run.elapsed_seconds == null ? "—" : liveIterationClock(run),
   };
   for (const label of FACTS) {
     const dd = head.cells[label];
     if (dd.textContent !== values[label]) dd.textContent = values[label];
-    // Plan is the live figure here now that state has gone to the header.
-    dd.className = label === "plan" && ACTIVE.has(run.state) ? "hot" : "";
+    dd.className = (label === "plan" && ACTIVE.has(run.state))
+      || (label === "iteration elapsed" && isWorking(run)) ? "hot" : "";
   }
 
   head.timing.textContent = timingText(run);
@@ -1398,24 +1413,28 @@ window.addEventListener("online", resumePolling);
 // One second, only while something is running and the tab is visible.
 setInterval(() => {
   if (document.hidden) return;
-  if (!state.runs.some((run) => run.state === "running")) return;
+  if (!state.runs.some(isWorking)) return;
   for (const [id, parts] of state.rows) {
     const run = state.runs.find((item) =>
       `${item.project}/${item.route_id || item.run_id}` === id);
-    if (!run || run.state !== "running") continue;
+    if (!run || !isWorking(run)) continue;
     parts.timing.textContent = timingText(run);
   }
   const shown = state.runs.find((run) => run.run_id === state.route.run_id);
   const panel = document.querySelector("#view-run .detail-timing");
-  if (panel && shown?.state === "running") panel.textContent = timingText(shown);
+  if (panel && shown && isWorking(shown)) panel.textContent = timingText(shown);
+  const iterationClock = state.shell?.head.cells["iteration elapsed"];
+  if (iterationClock && shown && isWorking(shown)) {
+    iterationClock.textContent = liveIterationClock(shown);
+  }
   const modelClock = document.querySelector("#view-run .model-meta .clock");
-  if (modelClock && shown?.state === "running") {
+  if (modelClock && shown && isWorking(shown)) {
     modelClock.textContent = `iteration ${liveElapsed(shown)}`;
   }
   // The strip carries the same clock, and it is on screen on every page.
   for (const [runId, parts] of runbar.rows) {
     const run = state.runs.find((item) => item.run_id === runId);
-    if (!run || run.state !== "running") continue;
+    if (!run || !isWorking(run)) continue;
     const clock = parts.meta.querySelector(".clock");
     if (clock) clock.textContent = liveElapsed(run);
   }

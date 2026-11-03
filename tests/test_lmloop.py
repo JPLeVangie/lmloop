@@ -1975,7 +1975,31 @@ class LocalServerWaitTests(unittest.TestCase):
 
         events = run.rundir.read_events()
         self.assertTrue(any(event["event"] == "provider:pause" for event in events))
-        self.assertTrue(any(event["event"] == "provider:resume" for event in events))
+        resumed = next(event for event in events if event["event"] == "provider:resume")
+        self.assertEqual(3, resumed["nextIteration"])
+        run.screen.log.assert_any_call(
+            "    local model provider is back; retrying iteration 3"
+        )
+
+    def test_committed_provider_outage_continues_with_the_next_iteration(self):
+        run = self.make_run("llama-swap/local-fast")
+        run.last_commit = "abc123"
+
+        def resume(*_args):
+            run.rundir.pause_path.unlink()
+
+        with mock.patch.object(loop.display, "wait_while_paused", side_effect=resume), \
+             mock.patch.object(run, "_server_is_up", return_value=True):
+            self.assertTrue(run._wait_for_server(3, "connection refused", retry_same=False))
+
+        resumed = next(
+            event for event in run.rundir.read_events()
+            if event["event"] == "provider:resume"
+        )
+        self.assertEqual(4, resumed["nextIteration"])
+        run.screen.log.assert_any_call(
+            "    local model provider is back; continuing with iteration 4"
+        )
 
     def test_provider_pause_does_not_resume_when_run_was_stopped(self):
         run = self.make_run("llama-swap/local-fast")
