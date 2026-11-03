@@ -458,7 +458,7 @@ def summarise(project: dict, run_dir: Path) -> dict:
         "paused": runrecord.paused(run_dir),
         "stopping": runrecord.stop_requested(run_dir),
         "iterations_done": len(outcomes),
-        "outcomes": outcomes[-12:],
+        "outcomes": outcomes,
         "commits": commits,
         "updated_at": status.get("updated_at"),
         "preview": preview,

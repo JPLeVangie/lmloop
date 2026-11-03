@@ -207,6 +207,19 @@ class NestedPilotDiscoveryTests(unittest.TestCase):
         summary = runs.summarise({"id": "project", "path": str(self.project)}, run_dir)
         self.assertEqual("omp", summary["agent"])
 
+    def test_summary_keeps_the_full_iteration_history(self):
+        run_dir = self.make_run(self.project, "history")
+        expected = ["ok"] * 13 + ["agent-error"] * 17
+        with (run_dir / "lmloop.log").open("a") as log:
+            for iteration, outcome in enumerate(expected, 1):
+                log.write(json.dumps({
+                    "event": "iteration:end", "iteration": iteration,
+                    "outcome": outcome,
+                }) + "\n")
+        summary = runs.summarise({"id": "project", "path": str(self.project)}, run_dir)
+        self.assertEqual(len(expected), summary["iterations_done"])
+        self.assertEqual(expected, summary["outcomes"])
+
     def test_running_summary_calculates_eta_from_durable_events(self):
         run_dir = self.make_run(self.project, "eta")
         (run_dir / "plan.md").write_text("- [x] one\n- [x] two\n- [ ] three\n")
