@@ -1296,24 +1296,81 @@ async function renderNew() {
   fresh.textContent = "+ new project…";
   $("project").append(fresh);
   if (state.project) $("project").value = state.project;
+  $("harness").replaceChildren(...state.config.harnesses.map((name) => {
+    const option = document.createElement("option");
+    option.value = option.textContent = name;
+    return option;
+  }));
   await updateProjectContext();
   toggleNewProject();
+  await loadProjectAgent();
+  $("iterations").value = state.config.default_max_iterations;
+}
 
-  // Fetched here rather than at startup: it costs a couple of seconds and only
-  // this form needs it.
-  const catalogue = state.models || (state.models = await api("/api/models"));
+let agentRequest = 0;
+let modelRequest = 0;
+
+async function loadHarnessModels(preferred = "") {
+  const request = ++modelRequest;
+  const selected = $("harness").value;
+  $("model").disabled = true;
+  $("launch-submit").disabled = true;
+  const catalogue = await api(`/api/models?harness=${encodeURIComponent(selected)}`);
+  if (request !== modelRequest) return;
   $("model").replaceChildren(...(catalogue.models || []).map((id) => {
     const option = document.createElement("option");
     option.value = option.textContent = id;
     return option;
   }));
-  $("model").value = state.config.default_model;
+  if (preferred && !(catalogue.models || []).includes(preferred)) {
+    const option = document.createElement("option");
+    option.value = preferred;
+    option.textContent = `${preferred} (configured; not listed)`;
+    $("model").prepend(option);
+  }
+  if (preferred) $("model").value = preferred;
   const source = modelSourceNote(catalogue);
   $("model-source").textContent = source;
   $("model-source").hidden = !source;
-  $("thinking").value = state.config.default_thinking || "";
-  $("iterations").value = state.config.default_max_iterations;
+  $("model").disabled = false;
+  $("launch-submit").disabled = false;
 }
+
+async function loadProjectAgent() {
+  const request = ++agentRequest;
+  ++modelRequest;
+  $("launch-submit").disabled = true;
+  $("model").disabled = true;
+  const project = $("project").value;
+  const agent = project && project !== "\u0000new"
+    ? await api(`/api/projects/${encodeURIComponent(project)}/agent`)
+    : { harness: state.config.default_harness, model: state.config.default_model,
+        thinking: state.config.default_thinking, required_tools: [] };
+  if (request !== agentRequest) return;
+  const required = agent.required_tools || [];
+  // A harness that cannot enforce a tool allowlist would be refused at launch;
+  // say so here instead.
+  for (const option of $("harness").options) {
+    const blocked = required.length > 0 && !state.config.verifying_harnesses.includes(option.value);
+    option.disabled = blocked;
+    option.textContent = blocked ? `${option.value} (can't enforce required tools)` : option.value;
+  }
+  $("harness").value = agent.harness;
+  $("thinking").value = agent.thinking || "";
+  $("required-tools").textContent = required.length
+    ? `Project requires: ${Array.isArray(required) ? required.join(", ") : required}. The selected harness must verify these tools.` : "";
+  $("required-tools").hidden = !required.length;
+  await loadHarnessModels(agent.model);
+}
+
+$("harness").addEventListener("change", () => {
+  ++agentRequest;
+  loadHarnessModels($("harness").value === state.config.default_harness
+    ? state.config.default_model : "").catch((error) => {
+      $("launch-error").textContent = error.message;
+      $("launch-error").hidden = false;
+    });
+});
 
 let currentBeadsIssues = [];
 
@@ -1380,7 +1437,12 @@ function toggleNewProject() {
 
 $("project").addEventListener("change", async () => {
   toggleNewProject();
-  await updateProjectContext();
+  try {
+    await Promise.all([updateProjectContext(), loadProjectAgent()]);
+  } catch (error) {
+    $("launch-error").textContent = error.message;
+    $("launch-error").hidden = false;
+  }
 });
 $("beads-issue").addEventListener("change", onBeadsIssueSelect);
 
@@ -1431,6 +1493,7 @@ $("launch-form").addEventListener("submit", async (event) => {
         project,
         objective: $("objective").value,
         issue: $("beads-issue").value || undefined,
+        harness: $("harness").value,
         model: $("model").value,
         thinking: $("thinking").value,
         max_iterations: Number($("iterations").value),

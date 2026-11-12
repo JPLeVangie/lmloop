@@ -1887,7 +1887,7 @@ class HarnessCapabilityTests(unittest.TestCase):
         # Not pi's flag, though omp is a pi fork: omp rejects `--list-models`
         # outright and has a `models` subcommand.  Verified against v17.4.0.
         self.assertEqual(["omp", "models"], harness.get("omp").list_models_argv())
-        self.assertEqual([], harness.get("opencode").list_models_argv())
+        self.assertEqual(["opencode", "models"], harness.get("opencode").list_models_argv())
 
     def test_each_adapter_claims_its_own_environment_namespace(self):
         self.assertEqual(("PI_*",), harness.get("pi").env_passthrough)

@@ -786,6 +786,53 @@ class StartRunTests(unittest.TestCase):
         self.assertIn("do it", argv)
         self.assertIn("--detach", argv)
 
+    def test_selected_harness_is_forwarded(self):
+        argv = self.start({"project": "project", "objective": "do it",
+                           "harness": "opencode"}).call_args.args[0]
+        self.assertEqual("opencode", argv[argv.index("--agent") + 1])
+
+    def test_invalid_harness_does_not_launch(self):
+        for value in ("missing", [], True):
+            ran = self.start({"project": "project", "objective": "do it", "harness": value})
+            self.assertEqual(400, self.handler.status)
+            ran.assert_not_called()
+
+    def test_required_tools_are_not_silently_discarded(self):
+        from web import service
+        effective = service.config_module.load(self.roots / "project")
+        effective["agent"].update({
+            "harness": "omp", "model": "test/model", "required_tools": ["browser"],
+            "tools": "browser,read,write,edit,bash", "thinking": "",
+        })
+        with mock.patch.object(service.config_module, "load", return_value=effective):
+            ran = self.start({"project": "project", "objective": "do it", "harness": "opencode"})
+        self.assertEqual(400, self.handler.status)
+        self.assertIn("cannot be verified", self.handler.payload["error"])
+        ran.assert_not_called()
+
+    def test_project_required_tools_accept_omp_and_keep_its_model(self):
+        effective = service.config_module.load(self.roots / "project")
+        effective["agent"].update({
+            "harness": "omp", "model": "project/model", "required_tools": ["browser", "inspect_image"],
+            "tools": "browser,inspect_image,read,write,edit,bash", "thinking": "",
+        })
+        with mock.patch.object(service.config_module, "load", return_value=effective), \
+             mock.patch.object(service.config_module.shutil, "which", return_value="/bin/omp"):
+            ran = self.start({"project": "project", "objective": "do it", "harness": "omp"})
+        self.assertEqual(200, self.handler.status)
+        argv = ran.call_args.args[0]
+        self.assertEqual("omp", argv[argv.index("--agent") + 1])
+        self.assertNotIn("--model", argv)
+
+    def test_dashboard_default_does_not_override_project_harness(self):
+        self.handler.config["harness"] = "opencode"
+        argv = self.start({"project": "project", "objective": "do it"}).call_args.args[0]
+        self.assertNotIn("--agent", argv)
+
+    def test_missing_harness_config_preserves_legacy_launch(self):
+        argv = self.start({"project": "project", "objective": "do it"}).call_args.args[0]
+        self.assertNotIn("--agent", argv)
+
     def test_iteration_budget_is_positive_and_bounded(self):
         for value in (0, -1, server.MAX_ITERATIONS + 1, "not-a-number", True):
             with self.subTest(value=value):

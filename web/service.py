@@ -29,6 +29,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import config as config_module
+import harness
 import runrecord
 from web import runs as runs_module
 from web import workspace
@@ -139,10 +140,23 @@ def start_run(payload: dict, config: dict, lmloop_path: str) -> tuple[int, dict]
         return 400, {"error": "invalid beads issue id"}
 
     argv = [config["python"], lmloop_path, "run", objective, "--detach"]
+    agent = payload.get("harness", "")
+    if not isinstance(agent, str):
+        return 400, {"error": "harness must be a string"}
+    try:
+        if agent:
+            harness.get(agent)
+        effective = config_module.load(Path(match[0]["path"]))
+        config_module.override_agent(effective, agent)
+        config_module.validate_required_tools(effective)
+    except SystemExit as error:
+        return 400, {"error": str(error)}
+    if agent:
+        argv += ["--agent", agent]
     if issue:
         argv += ["--issue", issue]
     for flag, key, default in (
-        ("--model", "model", config["default_model"]),
+        ("--model", "model", ""),
         ("--thinking", "thinking", config["default_thinking"]),
     ):
         value = str(payload.get(key) or default).strip()

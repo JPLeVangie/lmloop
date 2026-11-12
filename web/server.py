@@ -141,7 +141,7 @@ def build_push() -> push_module.WebPush:
 # asks llama-swap for its catalogue.  That is fine once and intolerable on every
 # page load, so the answer is cached and the endpoint that needs it is separate
 # from the one first paint waits on.  Models change when someone installs one.
-_MODEL_CACHE: dict = {"at": 0.0, "value": None}
+_MODEL_CACHE: dict = {"at": 0.0, "value": None, "harness": None}
 MODEL_CACHE_SECONDS = 300
 
 def _fallback_models(config: dict) -> list[str]:
@@ -171,7 +171,7 @@ def available_models(config: dict, force: bool = False) -> dict:
     the dashboard's -- which failure this was, so the sheet can say so.
     """
     fresh = time.monotonic() - _MODEL_CACHE["at"] < MODEL_CACHE_SECONDS
-    if _MODEL_CACHE["value"] and fresh and not force:
+    if _MODEL_CACHE["value"] and fresh and not force and _MODEL_CACHE.get("harness") == config["harness"]:
         return _MODEL_CACHE["value"]
     agent = config["harness"]
     try:
@@ -191,7 +191,7 @@ def available_models(config: dict, force: bool = False) -> dict:
         "models": models or _fallback_models(config),
         "model_source": agent if models else "fallback",
     }
-    _MODEL_CACHE.update(at=time.monotonic(), value=result)
+    _MODEL_CACHE.update(at=time.monotonic(), value=result, harness=agent)
     return result
 
 
@@ -400,6 +400,10 @@ class Handler(BaseHTTPRequestHandler):
                 "hidden_poll_seconds": self.config["hidden_poll_seconds"],
                 "read_only": self.config["read_only"],
                 "default_model": self.config["default_model"],
+                "default_harness": self.config.get("harness", "pi"),
+                "harnesses": sorted(harness._HARNESSES),
+                "verifying_harnesses": sorted(
+                    name for name in harness._HARNESSES if harness.get(name).verifies_required_tools),
                 "default_max_iterations": self.config["default_max_iterations"],
                 "default_thinking": self.config["default_thinking"],
                 "user": session["name"],
@@ -416,7 +420,23 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/models":
             # Fetched only when the new-run form opens, so first paint never
             # waits on a node process starting up.
-            return self.json(available_models(self.config, force="refresh" in parsed.query))
+            selected = parse_qs(parsed.query).get("harness", [self.config["harness"]])[0]
+            if selected not in harness._HARNESSES:
+                return self.json({"error": "unknown harness"}, 400)
+            return self.json(available_models(
+                dict(self.config, harness=selected, default_model=(
+                    self.config["default_model"] if selected == self.config["harness"] else "")),
+                force="refresh" in parsed.query))
+        if path.startswith("/api/projects/") and path.endswith("/agent"):
+            project_id = path[len("/api/projects/"): -len("/agent")]
+            match = [p for p in runs_module.projects(self.config["roots"]) if p["id"] == project_id]
+            if not match:
+                return self.json({"error": "no such project"}, 404)
+            try:
+                agent = config_module.load(Path(match[0]["path"]))["agent"]
+            except SystemExit as error:
+                return self.json({"error": str(error)}, 400)
+            return self.json({key: agent[key] for key in ("harness", "model", "thinking", "required_tools")})
         if path == "/api/projects":
             return self.json({"projects": runs_module.projects(self.config["roots"])})
         if path == "/api/system-prompt":

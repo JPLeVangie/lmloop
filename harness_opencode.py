@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 
 from harness_base import MESSAGE_END, TOOL, Harness, _tail
 
@@ -43,6 +44,17 @@ class OpencodeHarness(Harness):
             argv += ["--variant", thinking]
         return argv
 
+    def list_models_argv(self):
+        return [self.binary, "models"]
+
+    def catalogue(self):
+        result = subprocess.run(
+            [self.binary, "models"], capture_output=True, text=True, timeout=60,
+        )
+        if result.returncode:
+            raise subprocess.CalledProcessError(result.returncode, result.args, result.stdout, result.stderr)
+        return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
     def classify(self, event):
         kind = event.get("type")
         part = event.get("part") or {}
@@ -54,7 +66,8 @@ class OpencodeHarness(Harness):
                 "name": part.get("tool", ""),
                 "target": self._target(tool_input),
                 "identity": json.dumps(tool_input, sort_keys=True, separators=(",", ":")),
-                "path": tool_input.get("filePath"),
+                # v1 spelled it `filePath`; v2 (2.2.x) sends `path`.
+                "path": tool_input.get("filePath") or tool_input.get("path"),
             }
         if kind == "step_finish":
             tokens = part.get("tokens") or {}

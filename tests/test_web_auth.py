@@ -246,6 +246,15 @@ class ModelListingTests(unittest.TestCase):
         self.assertEqual(server.harness.get("pi").list_models_argv(), seen["pi"])
         self.assertEqual(["omp", "models", "--json"], seen["omp"])
 
+    def test_cache_does_not_cross_harnesses(self):
+        with mock.patch.object(server.subprocess, "run") as ran:
+            ran.return_value = mock.Mock(stdout="provider  pi-model  200K\n")
+            self.assertEqual(["provider/pi-model"], server.available_models(self.config())["models"])
+            ran.return_value = mock.Mock(stdout='{"models": [{"selector": "other/omp-model"}]}')
+            result = server.available_models(self.config(harness="omp"))
+        self.assertEqual("omp", result["model_source"])
+        self.assertNotIn("provider/pi-model", result["models"])
+
     def test_the_table_header_is_not_offered_as_a_model(self):
         stdout = ("provider    model    context\n"
                   "myprovider  some-model  200K\n")
@@ -270,9 +279,12 @@ class ModelListingTests(unittest.TestCase):
         self.assertEqual("unavailable", got["model_source"])
         self.assertEqual([], got["models"])
 
-    def test_an_agent_that_cannot_list_says_so(self):
-        got = server.available_models(self.config(harness="opencode"), force=True)
-        self.assertIn("cannot list", got["model_source"])
+    def test_opencode_model_catalogue_uses_full_selectors(self):
+        config = self.config(harness="opencode")
+        with mock.patch("harness_opencode.subprocess.run", return_value=mock.Mock(
+            returncode=0, args=["opencode", "models"], stdout="9router/agent-local\nprovider/model/x\n")):
+            got = server.available_models(config, force=True)
+        self.assertEqual(["9router/agent-local", "provider/model/x"], got["models"])
 
     def test_an_unknown_agent_does_not_crash_the_dashboard(self):
         got = server.available_models(self.config(harness="nonesuch"), force=True)

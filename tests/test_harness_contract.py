@@ -22,6 +22,7 @@ from pathlib import Path
 
 import harness
 import harness_omp
+import harness_opencode
 import harness_pi
 
 TESTDATA = Path(__file__).parent.parent / "testdata"
@@ -340,6 +341,30 @@ class DeclaredWindowContractTests(unittest.TestCase):
     def test_an_agent_with_no_catalogue_says_so_rather_than_guessing(self):
         self.assertEqual({}, harness.get("opencode").declared_windows())
 
+    def test_opencode_lists_full_model_selectors_from_lines(self):
+        output = "9router/agent-local\nprovider/model/variant [local]\nfoo@bar:baz\n"
+        with unittest.mock.patch.object(
+            harness_opencode.subprocess, "run",
+            return_value=unittest.mock.Mock(returncode=0, args=["opencode", "models"], stdout=output),
+        ) as run:
+            self.assertEqual(
+                ["9router/agent-local", "provider/model/variant [local]", "foo@bar:baz"],
+                harness.get("opencode").catalogue(),
+            )
+        self.assertEqual(["opencode", "models"], run.call_args.args[0])
+        self.assertEqual(60, run.call_args.kwargs["timeout"])
+
+    def test_opencode_model_listing_failure_is_not_an_empty_catalogue(self):
+        with unittest.mock.patch.object(
+            harness_opencode.subprocess, "run",
+            return_value=unittest.mock.Mock(returncode=1, args=["opencode", "models"], stdout="", stderr="failed"),
+        ):
+            with self.assertRaises(harness_opencode.subprocess.CalledProcessError):
+                harness.get("opencode").catalogue()
+
+    def test_opencode_exposes_models_command_to_cli(self):
+        self.assertEqual(["opencode", "models"], harness.get("opencode").list_models_argv())
+
 
 class _FakeFile:
     """Stands in for a `Path` that `declared_windows` only ever reads."""
@@ -390,6 +415,15 @@ class OpencodeCapturedEventTests(unittest.TestCase):
         self.assertEqual("write", result["name"])
         self.assertEqual("src/example.py", result["path"])
         self.assertTrue(result["target"])
+
+    def test_v2_spells_the_file_argument_path(self):
+        """opencode 2.2.x sends `path` where 1.x sent `filePath` (captured
+        from a real 2.2.7 `read` call); missing it loses every write's file."""
+        event = {"type": "tool_use", "part": {"tool": "write", "state": {
+            "status": "completed", "input": {"path": "/tmp/oc-probe/index.html"}}}}
+        result = harness.get("opencode").classify(event)
+        self.assertEqual("/tmp/oc-probe/index.html", result["path"])
+        self.assertEqual("index.html", result["target"])
 
     def test_a_step_carries_its_reason_and_token_counts(self):
         adapter = harness.get("opencode")
@@ -511,9 +545,13 @@ class CatalogueTests(unittest.TestCase):
         ):
             self.assertEqual(set(adapter.catalogue()), set(adapter.declared_windows()))
 
-    def test_an_agent_that_cannot_list_offers_nothing_rather_than_guessing(self):
-        self.assertEqual([], harness.get("opencode").list_models_argv())
-        self.assertEqual([], harness.get("opencode").catalogue())
+    def test_opencode_can_list_its_catalogue(self):
+        self.assertEqual(["opencode", "models"], harness.get("opencode").list_models_argv())
+        with unittest.mock.patch.object(
+            harness_opencode.subprocess, "run",
+            return_value=unittest.mock.Mock(returncode=0, args=["opencode", "models"], stdout=""),
+        ):
+            self.assertEqual([], harness.get("opencode").catalogue())
 
     def test_a_failure_to_run_reaches_the_caller(self):
         """The dashboard tells "could not be run" from "knows no models" apart,

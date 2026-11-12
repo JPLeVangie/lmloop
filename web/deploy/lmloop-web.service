@@ -22,7 +22,7 @@ Environment=PYTHONUNBUFFERED=1
 # lmloop shells out to the agent and to git, so pin the path: a change in the
 # manager environment would otherwise break run launching in a way that only
 # surfaces hours later, inside a run.
-Environment=PATH=%h/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=PATH=%h/.local/bin:%h/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 # Everything else -- host, port, roots, OIDC -- comes from
 # ~/.config/lmloop/web.env; see web.env.example.
 Restart=on-failure
