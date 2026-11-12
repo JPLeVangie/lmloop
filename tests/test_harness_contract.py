@@ -425,6 +425,28 @@ class OpencodeCapturedEventTests(unittest.TestCase):
         self.assertEqual("/tmp/oc-probe/index.html", result["path"])
         self.assertEqual("index.html", result["target"])
 
+    def test_an_allowlist_becomes_a_deny_all_per_run_agent(self):
+        adapter = harness.get("opencode")
+        common = dict(model="p/m", thinking="high", session_dir=Path("/s"), session_id="x")
+        argv = adapter.argv(tools="read,edit,bash", **common)
+        self.assertEqual("lmloop", argv[argv.index("--agent") + 1])
+        self.assertIn("--standalone", argv)  # the background server never sees the env config
+        self.assertEqual("p/m#high", argv[argv.index("--model") + 1])  # v2 has no --variant
+        self.assertNotIn("--variant", argv)
+        env = adapter.run_env("read,edit,bash")
+        self.assertEqual("1", env["OPENCODE_DISABLE_PROJECT_CONFIG"])
+        agent = json.loads(env["OPENCODE_CONFIG_CONTENT"])["agent"]["lmloop"]
+        self.assertEqual({"*": "deny", "read": "allow", "shell": "allow",
+                          "edit": {"*": "allow", ".": "deny"}}, agent["permission"])
+        self.assertNotIn("mcp", json.loads(env["OPENCODE_CONFIG_CONTENT"]))
+        self.assertEqual({}, adapter.run_env(""))
+
+    def test_browser_is_a_per_run_mcp_server_granted_by_prefix(self):
+        config = json.loads(harness.get("opencode").run_env("read,browser")["OPENCODE_CONFIG_CONTENT"])
+        server = harness_opencode.BROWSER_MCP
+        self.assertEqual("allow", config["agent"]["lmloop"]["permission"][f"{server}_*"])
+        self.assertIn("--isolated", config["mcp"][server]["command"])
+
     def test_a_step_carries_its_reason_and_token_counts(self):
         adapter = harness.get("opencode")
         for variant, reason in (("step_finish:stop", "stop"),

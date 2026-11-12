@@ -451,6 +451,9 @@ def validate_required_tools(config: dict) -> None:
         if missing_known:
             details.append("not known to " + harness_name + ": " + ", ".join(missing_known))
         raise SystemExit("lmloop: [agent] required_tools cannot be satisfied; " + "; ".join(details))
+    unmet = adapter.unmet_requirements(agent.get("model", ""), required)
+    if unmet:
+        raise SystemExit("lmloop: [agent] required_tools cannot be satisfied; " + "; ".join(unmet))
 
 
 def override_review(config: dict, rounds: int | None, every: int | None,

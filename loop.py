@@ -537,6 +537,7 @@ class Run:
         overrides = {"PYTHONPYCACHEPREFIX": str(self.rundir.path / "pycache")}
         if self.harness_name == "pi":
             overrides["PI_CODING_AGENT_DIR"] = str(adapter.config_dir)
+        overrides.update(adapter.run_env(self.config["agent"].get("tools", "")))
         return envpolicy.build(
             os.environ,
             inherit=settings.get("inherit", "allowlist"),

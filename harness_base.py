@@ -93,6 +93,14 @@ class Harness:
     def classify(self, event: dict) -> dict | None:
         raise NotImplementedError
 
+    def run_env(self, tools: str) -> dict:
+        """Environment additions that enforce `tools` for one run, if any."""
+        return {}
+
+    def unmet_requirements(self, model: str, required: list[str]) -> list[str]:
+        """Required tools this model cannot back (e.g. images on a text model)."""
+        return []
+
     def unknown_tools(self, tools: str) -> list[str]:
         """Names in a `tools` string this agent has never heard of.
 

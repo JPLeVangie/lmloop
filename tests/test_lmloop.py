@@ -2185,10 +2185,24 @@ class RequiredToolsTests(unittest.TestCase):
         self.assertFalse((root / ".worktrees").exists())
 
     def test_unverifiable_harness_rejects_requirements(self):
-        with self.assertRaisesRegex(SystemExit, "cannot be verified by opencode"):
+        with self.assertRaisesRegex(SystemExit, "cannot be verified by pi"):
             config.validate_required_tools({
-                "agent": {"harness": "opencode", "tools": "browser", "required_tools": ["browser"]}
+                "agent": {"harness": "pi", "tools": "browser", "required_tools": ["browser"]}
             })
+
+    def test_opencode_refuses_inspect_image_on_a_text_only_model(self):
+        models = json.dumps({"data": [
+            {"providerID": "p", "id": "text", "capabilities": {"input": ["text"]}},
+            {"providerID": "p", "id": "vision", "capabilities": {"input": ["text", "image"]}},
+        ]})
+        agent = {"harness": "opencode", "tools": "read,inspect_image", "required_tools": ["inspect_image"]}
+        with unittest.mock.patch("harness_opencode.subprocess.run",
+                                 return_value=unittest.mock.Mock(returncode=0, stdout=models)):
+            with self.assertRaisesRegex(SystemExit, "p/text does not accept image input"):
+                config.validate_required_tools({"agent": {**agent, "model": "p/text"}})
+            with self.assertRaisesRegex(SystemExit, "does not know model p/gone"):
+                config.validate_required_tools({"agent": {**agent, "model": "p/gone"}})
+            config.validate_required_tools({"agent": {**agent, "model": "p/vision#high"}})
 
 
 class ContextFilesTests(unittest.TestCase):

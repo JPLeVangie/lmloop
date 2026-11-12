@@ -1,14 +1,37 @@
-"""Adapter for opencode JSON event streams."""
+"""Adapter for opencode (v2) JSON event streams."""
 
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 
 from harness_base import MESSAGE_END, TOOL, Harness, _tail
 
+# The per-run MCP server that is `browser` for opencode, which has none built in.
+BROWSER_MCP = "lmloopbrowser"
+
+# lmloop tool name -> the opencode permission keys that grant it.  Every run
+# starts from `"*": "deny"`, so anything not granted here is unavailable.
+# `inspect_image` is `read` (it hands images to the model) plus a model that
+# accepts them; see `unmet_requirements`.
+TOOL_PERMISSIONS = {
+    "read": ("read",), "write": ("edit",), "edit": ("edit",), "replace": ("edit",),
+    "bash": ("shell",), "grep": ("grep",), "glob": ("glob",), "find": ("glob",), "ls": ("glob",),
+    "webfetch": ("webfetch",), "websearch": ("websearch",),
+    "browser": (f"{BROWSER_MCP}_*",), "inspect_image": ("read",),
+}
+
+
+def _browser_command() -> list[str]:
+    # ponytail: pinned MCP fetched by npx on first use; vendor it if runs must work offline.
+    command = ["npx", "-y", "chrome-devtools-mcp@1.10.1", "--headless", "--isolated", "--no-usage-statistics"]
+    chromium = shutil.which("chromium") or shutil.which("google-chrome")
+    return command + (["--executablePath", chromium] if chromium else [])
+
+
 class OpencodeHarness(Harness):
-    """opencode, via `run --format json`.
+    """opencode v2, via `run --format json`.
 
     Written against captured output rather than documentation.  Its stream is
     structured quite differently from pi's: events carry a `part`, tool calls
@@ -20,6 +43,14 @@ class OpencodeHarness(Harness):
     git-synthesised handoff.  And a step's `reason` is the closest thing it has
     to a stop reason -- `tool-calls` between steps, `stop` at the end -- so only
     the final one is meaningful.
+
+    The tool allowlist is a per-run agent, `lmloop`, delivered in
+    `OPENCODE_CONFIG_CONTENT` (see `run_env`).  `--standalone` matters: without
+    it `run` attaches to the background server, whose config never sees that
+    variable.  Measured on 2.2.7 against a stub model: under `"*": "deny"` only
+    granted tools reach the model, plus `skill`, which is offered but refuses
+    every call ("Permission denied: skill").  Global MCP servers, plugin tools
+    and a project's own opencode.json/plugins do not get through.
     """
 
     name = "opencode"
@@ -31,18 +62,67 @@ class OpencodeHarness(Harness):
     env_passthrough = ("OPENCODE_*",)
     interesting = ('"tool_use"', '"step_finish"')
     activity = (b'"text"', b'"tool_use"', b'"step_')
+    known_tools = frozenset(TOOL_PERMISSIONS)
+    verifies_required_tools = True
 
     def argv(self, *, model, tools, thinking, session_dir, session_id, system_prompt="", resume_session=""):
-        # opencode keeps its own sessions and takes no tool allowlist, so
-        # session_dir and tools have nowhere to go.  Saying so is better than
-        # passing flags it will reject.  It has no system-prompt flag either;
-        # pi_runner prepends `system_prompt` to the prompt for it.
+        # opencode keeps its own sessions, so session_dir has nowhere to go.
+        # It has no system-prompt flag either; pi_runner prepends
+        # `system_prompt` to the prompt for it.
         argv = [self.binary, "run", "--format", "json"]
+        if tools.strip():
+            argv += ["--standalone", "--archived", "--agent", "lmloop"]
         if model:
-            argv += ["--model", model]
-        if thinking:
-            argv += ["--variant", thinking]
+            # v2 dropped `--variant`; the variant rides on the selector.
+            argv += ["--model", f"{model}#{thinking}" if thinking else model]
         return argv
+
+    def run_env(self, tools):
+        names = [name.strip() for name in tools.split(",") if name.strip()]
+        if not names:
+            return {}
+        permission = {"*": "deny"}
+        for name in names:
+            for key in TOOL_PERMISSIONS.get(name, ()):
+                # `edit` also grants opencode's built-in `worktree_remove`, which
+                # no permission key switches off.  It refuses worktrees other
+                # than its own; denying edit on "." stops it removing the one
+                # the run lives in, and files inside still edit.
+                permission[key] = {"*": "allow", ".": "deny"} if key == "edit" else "allow"
+        config = {"agent": {"lmloop": {
+            "mode": "primary", "description": "lmloop iteration", "permission": permission,
+        }}}
+        if "browser" in names:
+            config["mcp"] = {BROWSER_MCP: {"type": "local", "command": _browser_command()}}
+        return {"OPENCODE_CONFIG_CONTENT": json.dumps(config), "OPENCODE_DISABLE_PROJECT_CONFIG": "1"}
+
+    def unmet_requirements(self, model, required):
+        if "inspect_image" not in required:
+            return []
+        if not model:
+            return ["inspect_image needs an explicit [agent] model to check for image input"]
+        selector = model.split("#", 1)[0]
+        try:
+            models = self._model_list()
+        except (OSError, subprocess.SubprocessError, ValueError, KeyError) as error:
+            return [f"inspect_image: could not ask opencode about {selector}: {type(error).__name__}"]
+        entry = next((m for m in models if f"{m.get('providerID')}/{m.get('id')}" == selector), None)
+        if entry is None:
+            return [f"inspect_image: opencode does not know model {selector}"]
+        # opencode assumes image input for a custom model that declares no
+        # modalities, so this trusts provider config, not a live probe.
+        if "image" not in (entry.get("capabilities") or {}).get("input", []):
+            return [f"inspect_image: {selector} does not accept image input"]
+        return []
+
+    def _model_list(self) -> list[dict]:
+        result = subprocess.run(
+            [self.binary, "api", "--standalone", "model.list"],
+            capture_output=True, text=True, timeout=60,
+        )
+        if result.returncode:
+            raise subprocess.CalledProcessError(result.returncode, result.args)
+        return json.loads(result.stdout)["data"]
 
     def list_models_argv(self):
         return [self.binary, "models"]

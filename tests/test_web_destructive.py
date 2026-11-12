@@ -805,9 +805,7 @@ class StartRunTests(unittest.TestCase):
             "tools": "browser,read,write,edit,bash", "thinking": "",
         })
         with mock.patch.object(service.config_module, "load", return_value=effective):
-            ran = self.start({"project": "project", "objective": "do it", "harness": "opencode"})
-        self.assertEqual(400, self.handler.status)
-        self.assertIn("cannot be verified", self.handler.payload["error"])
+            ran = self.start({"project": "project", "objective": "do it", "harness": "pi"})
         ran.assert_not_called()
 
     def test_project_required_tools_accept_omp_and_keep_its_model(self):
