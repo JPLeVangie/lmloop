@@ -1,0 +1,132 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>lmloop operator</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="/app.css">
+</head>
+<body data-view="list">
+<a class="skip" href="#detail-title">Skip to run detail</a>
+
+<header class="top">
+  <div class="wrap top-row">
+    <div class="brand"><span class="dot" aria-hidden="true"></span>lmloop<em>/operator</em></div>
+    <p class="sync" id="sync" role="status" data-state="loading">Connecting…</p>
+    <button type="button" class="btn ghost small" id="refresh">Refresh</button>
+  </div>
+</header>
+<p class="banner"><span class="wrap">Fixture evidence only &middot; loopback &middot; approval is a recorded note, never a Git change or production verification</span></p>
+
+<div class="wrap shell">
+  <aside class="runs-pane" id="runs-pane" aria-labelledby="runs-h">
+    <div class="sec-h">
+      <h2 id="runs-h">Runs</h2>
+      <span class="note" id="runs-count"></span>
+    </div>
+    <div id="runs-state" class="state" role="status"></div>
+    <ul class="runs" id="runs" aria-label="Runs, newest first"></ul>
+  </aside>
+
+  <main class="detail-pane" id="main">
+    <div id="detail-state" class="state" role="status"></div>
+
+    <article id="detail" hidden aria-labelledby="detail-title">
+      <a class="back" href="#/" id="back">&larr; All runs</a>
+
+      <header class="mast">
+        <p class="metastrip"><span id="d-kind"></span><span id="d-updated"></span></p>
+        <div class="title-row">
+          <h2 id="detail-title" tabindex="-1"></h2>
+          <span id="d-phase"></span>
+        </div>
+        <div class="prog-row">
+          <progress id="d-progress" max="1" value="0" aria-labelledby="d-progress-text"></progress>
+          <span id="d-progress-text" class="prog-text"></span>
+        </div>
+        <p class="alert" id="d-failure" hidden></p>
+        <p class="alert amber" id="d-lost" hidden>The owner process is gone while the run was mid-task. The worktree may hold unverified work; nothing was discarded.</p>
+        <ul class="warns" id="d-warnings" hidden></ul>
+      </header>
+
+      <section aria-labelledby="h-controls" class="sec">
+        <div class="sec-h"><h3 id="h-controls">Controls</h3>
+          <span class="note">Availability is computed by the server from run state and lease.</span></div>
+        <div class="acts" id="acts">
+          <div class="act"><button type="button" class="btn" data-action="pause">Pause</button><p class="why" id="why-pause"></p></div>
+          <div class="act"><button type="button" class="btn" data-action="stop">Stop</button><p class="why" id="why-stop"></p></div>
+          <div class="act"><button type="button" class="btn risk" data-action="stop_now">Stop now</button><p class="why" id="why-stop_now"></p></div>
+          <div class="act"><button type="button" class="btn" data-action="resume">Resume</button><p class="why" id="why-resume"></p></div>
+          <div class="act"><button type="button" class="btn" data-action="approve">Approve</button><p class="why" id="why-approve"></p></div>
+          <div class="act"><button type="button" class="btn ghost" data-action="request_changes">Request changes</button><p class="why" id="why-request_changes"></p></div>
+        </div>
+        <p class="busy" id="act-busy" hidden></p>
+        <p class="flash ok" id="act-ok" role="status" hidden></p>
+        <p class="flash bad" id="act-err" role="alert" hidden></p>
+      </section>
+
+      <div class="two">
+        <section aria-labelledby="h-tasks" class="sec">
+          <div class="sec-h"><h3 id="h-tasks">Tasks</h3><span class="note" id="tasks-note"></span></div>
+          <ol class="tasks" id="tasks"></ol>
+          <p class="empty" id="tasks-empty" hidden>No task list: a diagnostic-gate run has no tasks.</p>
+        </section>
+
+        <section aria-labelledby="h-evidence" class="sec">
+          <div class="sec-h"><h3 id="h-evidence">Evidence &amp; decision</h3></div>
+          <dl class="facts" id="facts"></dl>
+        </section>
+      </div>
+
+      <section aria-labelledby="h-logs" class="sec">
+        <div class="sec-h"><h3 id="h-logs">Gate &amp; logs</h3><span class="note">Tail only, capped at 64&nbsp;KiB.</span></div>
+        <div class="logbar">
+          <div class="chips" id="log-chips" role="group" aria-label="Log files"></div>
+          <label class="bytes">Tail
+            <select id="log-bytes">
+              <option value="4096">4 KiB</option>
+              <option value="16384" selected>16 KiB</option>
+              <option value="65536">64 KiB</option>
+            </select>
+          </label>
+          <button type="button" class="btn ghost small" id="log-reload" aria-disabled="true">Reload</button>
+        </div>
+        <p class="empty" id="logs-empty" hidden>No logs recorded for this run.</p>
+        <p class="loginfo" id="log-info" role="status"></p>
+        <pre class="logtext" id="log-text" tabindex="0" aria-label="Log text" hidden></pre>
+      </section>
+
+      <section aria-labelledby="h-events" class="sec">
+        <div class="sec-h"><h3 id="h-events">Events</h3><span class="note">Last 50, newest first.</span></div>
+        <div class="term">
+          <div class="term-bar"><i></i><i></i><span id="events-label">events.jsonl</span></div>
+          <ol class="term-body" id="events" tabindex="0" aria-labelledby="h-events"></ol>
+        </div>
+      </section>
+    </article>
+  </main>
+</div>
+
+<dialog id="dlg" aria-labelledby="dlg-title" aria-describedby="dlg-reason">
+  <h2 id="dlg-title"></h2>
+  <p class="dlg-run" id="dlg-run"></p>
+  <p id="dlg-reason" class="dlg-reason"></p>
+  <div id="dlg-note-wrap" hidden>
+    <label for="dlg-note" id="dlg-note-label">Note</label>
+    <textarea id="dlg-note" rows="4" autocomplete="off"></textarea>
+    <p class="count" id="dlg-count"></p>
+  </div>
+  <label class="ack" id="dlg-ack-wrap" hidden><input type="checkbox" id="dlg-ack"><span id="dlg-ack-text"></span></label>
+  <p class="flash bad" id="dlg-err" role="alert" hidden></p>
+  <div class="dlg-btns">
+    <button type="button" class="btn ghost" id="dlg-cancel">Cancel</button>
+    <button type="button" class="btn" id="dlg-ok" aria-disabled="true">Confirm</button>
+  </div>
+</dialog>
+
+<noscript><p class="banner">This console needs JavaScript. The same data is available as JSON under /api/runs.</p></noscript>
+<script src="/app.js"></script>
+</body>
+</html>
