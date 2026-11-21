@@ -1,11 +1,10 @@
 """Offline tests for sse_progress.py: python3 -m unittest rust/tools/test_sse_progress.py"""
-import json, os, socket, subprocess, sys, tempfile, threading, time, unittest
+import http.client, json, os, sys, tempfile, threading, time, unittest
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import sse_progress as sp
 
-BRIDGE = "/tmp/opencode/lm1x4.mus4.CKDUcQ/bridge.py"
 SECRET = "SECRET-PROMPT-TEXT-xyz"
 
 
@@ -26,7 +25,8 @@ class Clock:
 
 class Base(unittest.TestCase):
     def setUp(self):
-        self.dir = tempfile.mkdtemp(prefix="sse_progress.", dir="/tmp/opencode")
+        self.temp = tempfile.TemporaryDirectory(prefix="sse_progress.")
+        self.dir = self.temp.name
         self.path = os.path.join(self.dir, "progress")
         fd = os.open(self.path, os.O_CREAT | os.O_WRONLY, 0o600)
         os.close(fd)
@@ -39,9 +39,7 @@ class Base(unittest.TestCase):
                 os.close(self.sink.fd)
             except OSError:
                 pass
-        for f in os.listdir(self.dir):
-            os.unlink(os.path.join(self.dir, f))
-        os.rmdir(self.dir)
+        self.temp.cleanup()
 
     def reset(self):
         os.close(self.sink.fd)
@@ -175,56 +173,48 @@ class Sink(Base):
 
 
 class Stub(BaseHTTPRequestHandler):
-    protocol_version = "HTTP/1.1"  # chunked, like a real upstream (HTTP/1.0 close-delimited bodies null out conn.sock)
+    protocol_version = "HTTP/1.1"
 
     def log_message(self, *a):
         pass
 
-    def do_POST(self):
-        self.rfile.read(int(self.headers["Content-Length"]))
+    def do_GET(self):
         self.send_response(200)
-        self.send_header("Content-Type", "text/event-stream")
-        self.send_header("Transfer-Encoding", "chunked")
+        self.send_header("Content-Length", str(len(self.server.body)))
         self.end_headers()
-        for piece in self.server.pieces:
-            self.wfile.write(b"%x\r\n" % len(piece) + piece + b"\r\n")
-            self.wfile.flush()
-            time.sleep(0.05)
-        self.wfile.write(b"0\r\n\r\n")
+        self.wfile.write(self.server.body)
 
 
-@unittest.skipUnless(os.path.exists(BRIDGE), "scratch bridge not present")
-class WithBridge(Base):
-    def test_bytes_unchanged_and_progress_written(self):
+class Wrapper(unittest.TestCase):
+    def test_read1_bytes_unchanged_and_progress_written(self):
         stream = (b": keepalive\n\n" + delta(role="assistant") + delta(content=SECRET) + b"data: [DONE]\n\n")
-        cut = stream.index(SECRET.encode()) + 5  # split mid-JSON, mid-secret
-        up = HTTPServer(("127.0.0.1", 0), Stub)
-        up.pieces = [stream[:7], stream[7:cut], stream[cut:]]
-        threading.Thread(target=up.serve_forever, daemon=True).start()
-        sock, log = os.path.join(self.dir, "b.sock"), os.path.join(self.dir, "b.log")
-        proc = subprocess.Popen(
-            [sys.executable, sp.__file__, "--progress-file", self.path, "--bridge", BRIDGE, "--",
-             "--sock", sock, "--upstream", "http://127.0.0.1:%d/v1/chat/completions" % up.server_port,
-             "--model", "m", "--log", log, "--lifetime", "30"],
-            stdout=subprocess.PIPE, stdin=subprocess.DEVNULL)
-        try:
-            self.assertEqual(proc.stdout.readline().strip(), b"bridge ready")
-            body = json.dumps({"model": "m", "stream": True, "tools": [{}], "messages": []}).encode()
-            c = socket.socket(socket.AF_UNIX)
-            c.connect(sock)
-            c.sendall(b"POST /v1/chat/completions HTTP/1.0\r\nContent-Length: %d\r\n\r\n" % len(body) + body)
-            got = b""
-            while (b := c.recv(4096)):
-                got += b
-            self.assertEqual(got.split(b"\r\n\r\n", 1)[1], stream)
-            self.assertEqual(self.written(), b"model\n")
-        finally:
-            c.close()
-            proc.terminate()
-            proc.wait(5)
-            proc.stdout.close()
-            up.shutdown()
-            up.server_close()
+        with tempfile.TemporaryDirectory(prefix="sse_progress.") as directory:
+            path = os.path.join(directory, "progress")
+            fd = os.open(path, os.O_CREAT | os.O_WRONLY, 0o600)
+            os.close(fd)
+            sink = sp.ProgressSink(path)
+            server = HTTPServer(("127.0.0.1", 0), Stub)
+            server.body = stream
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                sp.wrap_bridge(sink)
+                conn = http.client.HTTPConnection("127.0.0.1", server.server_port)
+                conn.request("GET", "/")
+                response = conn.getresponse()
+                chunks = []
+                while chunk := response.read1(7):
+                    chunks.append(chunk)
+                conn.close()
+                self.assertEqual(b"".join(chunks), stream)
+                with open(path, "rb") as f:
+                    progress = f.read()
+                self.assertEqual(progress, b"model\n")
+                self.assertNotIn(SECRET.encode(), progress)
+            finally:
+                os.close(sink.fd)
+                server.shutdown()
+                server.server_close()
 
 
 if __name__ == "__main__":

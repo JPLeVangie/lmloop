@@ -8,7 +8,11 @@
 //! * Binds `127.0.0.1` only; there is no host option. `Host` must equal the bound
 //!   `ip:port` exactly (stops DNS rebinding). `Forwarded`/`X-Forwarded-*` are ignored.
 //! * Behind `--public-origin`, `GET` may omit `Origin` (top-level navigation does);
-//!   any present `Origin` must still equal it. Auth is checked on every route.
+//!   any present `Origin` must still equal it. Basic auth is checked on every route
+//!   except `GET /health`, which Android's setup probe calls without credentials; it
+//!   still needs the exact Host/Origin and answers only fixed readiness fields.
+//! * Android read contract (additive; bearer/OIDC is not part of it): `GET /api/config`,
+//!   `GET /api/runs/lmloop/<id>`, and Android aliases on `/api/runs` rows (see `with_android`).
 //! * `POST` also needs `Origin: http://<ip:port>` exactly, `Content-Type:
 //!   application/json`, and, when sent, `Sec-Fetch-Site: same-origin`. A browser on
 //!   another origin cannot satisfy that; there is no CORS, so it cannot read replies.
@@ -36,7 +40,8 @@
 // An early-return `Response` is the natural error here; boxing it buys nothing.
 #![allow(clippy::result_large_err)]
 
-use crate::operator::{Control, Decision, Operator};
+use crate::lease::LeaseState;
+use crate::operator::{Control, Decision, Operator, RunKind, RunSummary};
 use crate::state::{Error, Result as StateResult};
 use axum::Router;
 use axum::body::Bytes;
@@ -46,7 +51,7 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use serde_json::json;
+use serde_json::{Value, json};
 use std::fs::OpenOptions;
 use std::io::Read;
 use std::net::Ipv4Addr;
@@ -250,7 +255,13 @@ fn router(ctx: Arc<Ctx>) -> Router {
             "/app.js",
             get(|| async { asset("text/javascript; charset=utf-8", APP_JS) }),
         )
+        .route("/health", get(health))
+        .route(
+            "/api/config",
+            get(|| async { axum::Json(json!({ "poll_seconds": 5.0, "read_only": false })) }),
+        )
         .route("/api/runs", get(list))
+        .route("/api/runs/{project}/{id}", get(android_view))
         .route("/api/runs/{id}", get(view))
         .route("/api/runs/{id}/logs/{name}", get(log))
         .route("/api/runs/{id}/control", post(control))
@@ -299,7 +310,10 @@ fn admit(c: &Ctx, req: &Request) -> Result<(), Response> {
             "Host and Origin must match the configured server origin",
         ));
     }
-    if let Some((user, password)) = &c.auth {
+    // The Android client's setup probe sends no credentials by design; the exact-host
+    // check above still applies and the reply is only `health`'s fixed readiness fields.
+    let health = req.method() == Method::GET && req.uri().path() == "/health";
+    if let Some((user, password)) = c.auth.as_ref().filter(|_| !health) {
         let auth = one(h, header::AUTHORIZATION);
         let expected = basic_value(&format!("{user}:{password}"));
         if auth != Some(expected.as_str()) {
@@ -461,11 +475,81 @@ struct LogQuery {
     bytes: Option<usize>,
 }
 
+/// The Rust store has no per-run project; Android's `/api/runs/<project>/<id>` gets this one.
+const PROJECT: &str = "lmloop";
+
+/// `summary` as the Android client's `RunSummary` reads it: every Rust field kept, plus
+/// `route_id`, `project`, `state`, `title`, `paused`, `stopping`. Fields the Operator
+/// does not know (iteration, plan, model, agent, commits) are left out, never invented.
+/// `title` is the run id (the Python dashboard's own last fallback). Android's `state`
+/// vocabulary is coarser: `failed`/`interrupted` and a diagnostic `gate_finished` read
+/// `stopped` (a gate probe never completes an objective); `completed` is only a serial run
+/// whose tasks are all done without a failure. The original `phase`/`failure` stay beside it.
+fn android_state(s: &RunSummary) -> &'static str {
+    let held = s
+        .lease
+        .as_ref()
+        .is_some_and(|l| l.state == LeaseState::Held);
+    let stop = s.pending_controls.iter().any(|c| c != "PAUSE");
+    match (s.kind, s.phase.as_str()) {
+        (RunKind::Invalid, _) => "unknown",
+        (RunKind::SerialFixture | RunKind::SerialPilot, "complete")
+            if s.tasks_done == s.tasks_total && s.failure.is_none() =>
+        {
+            "completed"
+        }
+        // An unverifiable `complete` is not terminal for Android.
+        (RunKind::SerialFixture | RunKind::SerialPilot, "complete") => "unknown",
+        (_, "stopped" | "interrupted" | "failed" | "gate_finished") => "stopped",
+        (_, "paused") => "paused",
+        _ if held && stop => "stopping",
+        _ if held => "running",
+        _ => "stale",
+    }
+}
+
+fn with_android(s: &RunSummary, mut v: Value) -> Value {
+    let state = android_state(s);
+    v["route_id"] = json!(s.run_id);
+    v["project"] = json!(PROJECT);
+    v["state"] = json!(state);
+    v["title"] = json!(s.run_id);
+    v["paused"] = json!(state == "paused");
+    v["stopping"] = json!(state == "stopping");
+    v
+}
+
+/// Android's setup probe: fixed, non-sensitive readiness (`read_only` is false because the
+/// Rust console does have mutations; they stay behind `admit`). `auth` is kept because
+/// Android's `HealthResponse` requires `auth`/`oidc`/`read_only` with no defaults, so
+/// dropping it fails setup; it only says Basic is on, and the 401s on every other route
+/// already reveal that.
+async fn health(State(c): State<Arc<Ctx>>) -> Response {
+    let auth = if c.auth.is_some() { "basic" } else { "none" };
+    axum::Json(json!({ "status": "ok", "auth": auth, "oidc": false, "read_only": false }))
+        .into_response()
+}
+
 async fn list(State(c): State<Arc<Ctx>>) -> Response {
     blocking(move || {
-        Operator::new(&c.root)
-            .list_runs()
-            .map(|runs| json!({ "runs": runs }))
+        Operator::new(&c.root).list_runs().map(|runs| {
+            let runs: Vec<Value> = runs.iter().map(|r| with_android(r, json!(r))).collect();
+            json!({ "runs": runs })
+        })
+    })
+    .await
+}
+
+async fn android_view(
+    State(c): State<Arc<Ctx>>,
+    Path((project, id)): Path<(String, String)>,
+) -> Response {
+    if project != PROJECT {
+        return fail(Error::new("no_run", format!("no such project: {project}")));
+    }
+    blocking(move || {
+        let v = Operator::new(&c.root).view(&id)?;
+        Ok(with_android(&v.summary, json!(v)))
     })
     .await
 }
@@ -528,4 +612,103 @@ async fn resume(State(c): State<Arc<Ctx>>, Path(id): Path<String>, body: Bytes) 
         Operator::new(&c.root).resume(&id)
     })
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lease::LeaseInfo;
+
+    fn sum(
+        kind: RunKind,
+        phase: &str,
+        done: usize,
+        failure: Option<&str>,
+        held: bool,
+        ctl: &[&str],
+    ) -> RunSummary {
+        RunSummary {
+            run_id: "r".into(),
+            kind,
+            phase: phase.into(),
+            lease: Some(LeaseInfo {
+                state: if held {
+                    LeaseState::Held
+                } else {
+                    LeaseState::Free
+                },
+                pid: None,
+                command: None,
+                started_at_unix: None,
+            }),
+            owner_lost: false,
+            tasks_done: done,
+            tasks_total: 2,
+            failure: failure.map(Into::into),
+            pending_controls: ctl.iter().map(|c| c.to_string()).collect(),
+            problem: None,
+        }
+    }
+
+    #[test]
+    fn android_state_never_fabricates_completion() {
+        use RunKind::*;
+        let cases = [
+            (
+                sum(SerialFixture, "complete", 2, None, false, &[]),
+                "completed",
+            ),
+            (
+                sum(SerialPilot, "complete", 2, None, false, &[]),
+                "completed",
+            ),
+            (
+                sum(SerialFixture, "complete", 1, None, false, &[]),
+                "unknown",
+            ),
+            (
+                sum(SerialFixture, "complete", 2, Some("t: x (y)"), false, &[]),
+                "unknown",
+            ),
+            (
+                sum(SerialFixture, "failed", 1, Some("t: x (y)"), false, &[]),
+                "stopped",
+            ),
+            (
+                sum(SerialFixture, "stopped", 1, None, false, &[]),
+                "stopped",
+            ),
+            (sum(SerialFixture, "paused", 1, None, false, &[]), "paused"),
+            (
+                sum(SerialFixture, "worker", 1, None, true, &["STOP"]),
+                "stopping",
+            ),
+            (
+                sum(SerialFixture, "worker", 1, None, true, &["PAUSE"]),
+                "running",
+            ),
+            (sum(SerialFixture, "worker", 1, None, false, &[]), "stale"),
+            (
+                sum(DiagnosticGate, "gate_finished", 0, None, false, &[]),
+                "stopped",
+            ),
+            (
+                sum(DiagnosticGate, "interrupted", 0, None, false, &[]),
+                "stopped",
+            ),
+            (
+                sum(DiagnosticGate, "gate_running", 0, None, true, &[]),
+                "running",
+            ),
+            (
+                sum(DiagnosticGate, "gate_running", 0, None, true, &["STOP-NOW"]),
+                "stopping",
+            ),
+            (sum(Invalid, "invalid", 0, None, false, &[]), "unknown"),
+            (sum(Invalid, "complete", 2, None, false, &[]), "unknown"),
+        ];
+        for (s, want) in cases {
+            assert_eq!(android_state(&s), want, "{:?} {}", s.kind, s.phase);
+        }
+    }
 }

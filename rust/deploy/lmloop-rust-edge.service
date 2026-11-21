@@ -1,0 +1,41 @@
+# OIDC/bearer edge in front of the Rust backend (lm-1x4), systemd *user* unit.
+#
+# Chain: TLS proxy -> private transport -> 127.0.0.1:${LMLOOP_RUST_EDGE_PORT}
+# (this) -> 127.0.0.1:${LMLOOP_RUST_BACKEND_PORT} (lmloop-rust-web).
+# The edge binds loopback only, and gateway.py has no option to change that.
+# A proxy on another machine therefore cannot connect to it. Either run the
+# proxy on this host, or give it a private transport that ends at this host's
+# loopback port (see README.md, "Topology"). The proxy must forward the public
+# Host unchanged; the edge answers 421 to anything else.
+[Unit]
+Description=lmloop Rust auth edge (loopback only, behind the TLS proxy)
+Requires=lmloop-rust-web.service
+After=lmloop-rust-web.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# gateway.py imports config.py, harness*.py, models.py and web/ from the
+# release root, so the whole release tree must be there, not just rust/edge.
+# PyJWT and requests must be installed for /usr/bin/python3; without them
+# --check fails and the unit does not start.
+ExecStartPre=/usr/bin/python3 %h/lmloop-rust/current/rust/edge/gateway.py --check \
+  --public-origin ${LMLOOP_EDGE_PUBLIC_ORIGIN} --issuer ${LMLOOP_EDGE_ISSUER} \
+  --client-id ${LMLOOP_EDGE_CLIENT_ID} --listen-port ${LMLOOP_RUST_EDGE_PORT} \
+  --backend-port ${LMLOOP_RUST_BACKEND_PORT} --auth-file %h/.config/lmloop-rust/backend-auth
+ExecStart=/usr/bin/python3 %h/lmloop-rust/current/rust/edge/gateway.py \
+  --public-origin ${LMLOOP_EDGE_PUBLIC_ORIGIN} --issuer ${LMLOOP_EDGE_ISSUER} \
+  --client-id ${LMLOOP_EDGE_CLIENT_ID} --listen-port ${LMLOOP_RUST_EDGE_PORT} \
+  --backend-port ${LMLOOP_RUST_BACKEND_PORT} --auth-file %h/.config/lmloop-rust/backend-auth
+# Operator subs, secret references and optional device tokens; see edge.env.example.
+EnvironmentFile=%h/.config/lmloop-rust/edge.env
+Environment=PYTHONUNBUFFERED=1
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=15
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target
