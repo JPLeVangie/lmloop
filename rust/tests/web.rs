@@ -732,3 +732,135 @@ fn web_has_no_remote_bind_option() {
         assert_eq!(out.status.code(), Some(2), "{args:?}: {out:?}");
     }
 }
+
+/// Shapes `android/.../net/{LmloopApiClient,RunModels}.kt` decode: `HealthResponse`
+/// (status/auth/oidc/read_only all required), `ServerInfo`, `RunsResponse`, `RunSummary`.
+fn assert_android_summary(r: &Value, id: &str, state: &str) {
+    for (k, want) in [
+        ("run_id", id),
+        ("route_id", id),
+        ("project", "lmloop"),
+        ("title", id),
+        ("state", state),
+    ] {
+        assert_eq!(r[k], want, "{k} in {r}");
+    }
+    assert_eq!(r["paused"], state == "paused");
+    assert_eq!(r["stopping"], false);
+    // Original Rust fields stay; nothing Android would read as progress is invented.
+    for k in [
+        "kind",
+        "phase",
+        "lease",
+        "owner_lost",
+        "tasks_done",
+        "tasks_total",
+        "failure",
+        "pending_controls",
+        "problem",
+    ] {
+        assert!(r.get(k).is_some(), "lost {k}");
+    }
+    for k in [
+        "iteration",
+        "max_iterations",
+        "plan_done",
+        "plan_total",
+        "model",
+        "agent",
+        "commits",
+    ] {
+        assert!(r.get(k).is_none(), "fabricated {k}");
+    }
+}
+
+#[test]
+fn android_read_contract_additive_and_guarded() {
+    let s = Scratch::new("android");
+    s.start_paused("r1", "ok|docs/two.txt|second");
+    let srv = s.serve();
+    let a = srv.addr.as_str();
+
+    let h = get(a, "/health").json();
+    assert_eq!(
+        h,
+        json!({"status": "ok", "auth": "none", "oidc": false, "read_only": false})
+    );
+    let c = get(a, "/api/config");
+    assert_eq!(
+        (
+            c.status,
+            c.json()["poll_seconds"].as_f64(),
+            c.json()["read_only"].as_bool()
+        ),
+        (200, Some(5.0), Some(false))
+    );
+    let list = get(a, "/api/runs").json();
+    assert_android_summary(&list["runs"][0], "r1", "paused");
+    let run = get(a, "/api/runs/lmloop/r1");
+    assert_eq!(run.status, 200);
+    assert_android_summary(&run.json(), "r1", "paused");
+    // The detail still carries every original view field, and the old route is unchanged.
+    let old = get(a, "/api/runs/r1").json();
+    for k in [
+        "actions", "tasks", "complete", "evidence", "decision", "logs", "events", "warnings",
+    ] {
+        assert_eq!(run.json()[k], old[k], "{k}");
+    }
+    assert_eq!(get(a, "/api/runs/other/r1").status, 404);
+    assert_eq!(get(a, "/api/runs/lmloop/zzz").status, 404);
+    // Still no mutation and still exact-host: an alias POST is not a route, a foreign Host is denied.
+    assert_eq!(post(a, "/api/runs/lmloop/r1/resume", json!({})).status, 404);
+    assert_eq!(
+        raw(a, "GET", "/health", &[("Host", "evil.example")], b"").status,
+        403
+    );
+
+    // Behind Basic auth: only /health is open (no credentials), and only for the exact Host.
+    let s = Scratch::new("android-auth");
+    s.start_paused("r1", "ok|docs/two.txt|second");
+    let srv = s.serve_auth();
+    let a = srv.addr.as_str();
+    let pub_host = [("Host", "loop.example")];
+    let h = raw(a, "GET", "/health", &pub_host, b"");
+    assert_eq!(h.status, 200);
+    assert_eq!(h.json()["auth"], "basic");
+    assert_eq!(raw(a, "GET", "/health", &[("Host", a)], b"").status, 200);
+    assert_eq!(
+        raw(a, "GET", "/health", &[("Host", "evil.example")], b"").status,
+        403
+    );
+    assert_eq!(
+        raw(
+            a,
+            "GET",
+            "/health",
+            &[("Host", "loop.example"), ("Origin", "https://evil.example")],
+            b""
+        )
+        .status,
+        403
+    );
+    for p in ["/api/config", "/api/runs", "/api/runs/lmloop/r1"] {
+        assert_eq!(raw(a, "GET", p, &pub_host, b"").status, 401, "{p}");
+    }
+    let auth = (
+        "Authorization",
+        "Basic dGVzdC11c2VyOmNvcnJlY3QtaG9yc2UtYmF0dGVyeQ==",
+    );
+    for p in ["/api/config", "/api/runs/lmloop/r1"] {
+        assert_eq!(
+            raw(a, "GET", p, &[pub_host[0], auth], b"").status,
+            200,
+            "{p}"
+        );
+    }
+    let resume = raw(
+        a,
+        "POST",
+        "/api/runs/r1/resume",
+        &[pub_host[0], ("Content-Type", "application/json")],
+        b"{}",
+    );
+    assert_eq!(resume.status, 403);
+}

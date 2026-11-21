@@ -1,0 +1,31 @@
+# Rust `lmloop web` backend, as a systemd *user* unit (lm-1x4 preview).
+#
+# Runs from an immutable release directory, never from a working checkout, and
+# keeps its own fresh state -- it reads nothing the Python lmloop wrote.
+# Loopback only: the binary binds 127.0.0.1 and cannot be told otherwise. Public
+# traffic reaches it only through lmloop-rust-edge.service. See README.md here.
+[Unit]
+Description=lmloop Rust web backend (loopback, behind lmloop-rust-edge)
+
+[Service]
+Type=simple
+# `current` is a symlink to releases/<id>; point it, then restart. The unit
+# itself never names a commit.
+ExecStart=%h/lmloop-rust/current/rust/target/release/lmloop web \
+  --port ${LMLOOP_RUST_BACKEND_PORT} \
+  --state-root %S/lmloop-rust \
+  --auth-file %h/.config/lmloop-rust/backend-auth
+# Ports only; both units read the same file. Secrets are file: references there.
+EnvironmentFile=%h/.config/lmloop-rust/edge.env
+# %S/lmloop-rust, created 0700: the Rust state root insists on it.
+StateDirectory=lmloop-rust
+StateDirectoryMode=0700
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=15
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target

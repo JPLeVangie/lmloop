@@ -24,6 +24,7 @@ const state = {
   inflight: new Map(), // `${run}:${action}` -> true
   flashes: new Map(), // run -> { kind, text, at }
   dlg: null, // { id, action, invoker }
+  auth: undefined, // undefined until /api/config answers; then "oidc" (edge) or null (standalone)
 };
 
 /* ───── small helpers ───── */
@@ -81,28 +82,62 @@ class ApiError extends Error {
   }
 }
 
+const SESSION_EXPIRED = "Your sign-in session has expired. Reload and sign in again.";
+
 async function api(path, opts) {
   let r;
   try {
-    r = await fetch(path, { cache: "no-store", ...opts });
+    // "manual": an expired OIDC session answers with a cross-origin redirect to the IdP,
+    // which fetch would otherwise report as an unreadable network failure.
+    r = await fetch(path, { cache: "no-store", redirect: "manual", ...opts });
   } catch (_) {
     throw new ApiError("network", "Cannot reach the lmloop server.");
   }
+  if (r.type === "opaqueredirect") throw new ApiError("session_expired", SESSION_EXPIRED, 401);
+  let raw = "";
+  try {
+    raw = await r.text();
+  } catch (_) {
+    /* unreadable body */
+  }
   let body = null;
   try {
-    body = await r.json();
+    body = JSON.parse(raw);
   } catch (_) {
     /* not JSON */
   }
   if (!r.ok) {
+    // The Rust server sends {error:{kind,message}}; the OIDC edge may send {error:"text"},
+    // {message:"text"} or plain text/HTML.
     const e = body && body.error;
-    throw new ApiError((e && e.kind) || `http_${r.status}`, (e && e.message) || `HTTP ${r.status}`, r.status);
+    const str = (v) => (typeof v === "string" && v.trim() ? v.trim().slice(0, 200) : "");
+    const plain = raw && !/^\s*</.test(raw) && body === null ? str(raw) : "";
+    const kind = (e && e.kind) || "";
+    // Basic keeps its own {kind:"unauthorized"} reply and the browser's credential prompt.
+    if (r.status === 401 && (edge() || (!kind && state.auth === undefined))) throw new ApiError("session_expired", SESSION_EXPIRED, 401);
+    throw new ApiError(str(kind) || `http_${r.status}`, str(e && e.message) || str(e) || str(body && body.message) || plain || `HTTP ${r.status}`, r.status);
   }
   if (body === null) throw new ApiError("bad_reply", "The server sent a reply this page cannot read.");
   return body;
 }
-const post = (path, body) =>
-  api(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body || {}) });
+// Standalone Basic config has no `auth`/`csrf`. The OIDC edge adds `auth: "oidc"`
+// and a per-session `csrf`; the token is read per mutation and never stored or put
+// in a URL, so an expired session fails at /api/config instead of using a stale one.
+const OIDC_NO_RESUME = "resume is not offered through the OIDC edge; use the standalone console";
+const edge = () => state.auth === "oidc";
+
+async function post(path, body, action) {
+  const cfg = await api("/api/config");
+  state.auth = cfg.auth || null;
+  const headers = { "Content-Type": "application/json" };
+  if (cfg.read_only === true) throw new ApiError("read_only", "This console is read-only.");
+  if (edge()) {
+    if (action === "resume") throw new ApiError("forbidden", OIDC_NO_RESUME);
+    if (typeof cfg.csrf !== "string" || !cfg.csrf) throw new ApiError("csrf_missing", "The session has no CSRF token; reload and sign in again.");
+  }
+  if (typeof cfg.csrf === "string" && cfg.csrf) headers["X-CSRF-Token"] = cfg.csrf;
+  return api(path, { method: "POST", headers, body: JSON.stringify(body || {}) });
+}
 
 /* ───── status vocabulary ───── */
 function phaseClass(p) {
@@ -144,6 +179,10 @@ function renderSync(mode) {
 
 /* ───── routing ───── */
 function parseHash() {
+  // Android's `#lmloop/<runId>` alias: only project "lmloop", and only an ID the
+  // Rust side would itself accept (state::validate_run_id).
+  const a = /^#lmloop\/([A-Za-z0-9][A-Za-z0-9_-]{0,63})$/.exec(location.hash);
+  if (a) return a[1];
   const m = /^#\/run\/([^/]+)$/.exec(location.hash);
   if (!m) return null;
   try {
@@ -189,9 +228,10 @@ function setState(id, kind, text, retry) {
   box.dataset.kind = kind;
   const kids = [document.createTextNode(text)];
   if (retry) {
-    const b = el("button", "btn ghost small", "Retry");
+    const expired = retry === "signin";
+    const b = el("button", "btn ghost small", expired ? "Sign in again" : "Retry");
     b.type = "button";
-    b.addEventListener("click", () => refresh());
+    b.addEventListener("click", () => (expired ? location.assign("/") : refresh()));
     kids.push(document.createElement("br"), b);
   }
   box.replaceChildren(...kids);
@@ -205,42 +245,58 @@ async function refresh() {
   }
   state.refreshing = true;
   clearTimeout(state.timer);
-  const id = state.selected;
-  const [l, d] = await Promise.allSettled([
-    api("/api/runs"),
-    id ? api(`/api/runs/${enc(id)}`) : Promise.resolve(null),
-  ]);
-  let ok = true;
-  if (l.status === "fulfilled") {
-    applyList(l.value.runs || []);
-  } else {
-    ok = false;
-    if (state.runs === null) setState("runs-state", "error", `Could not load runs: ${l.reason.message}`, true);
-  }
-  if (id === state.selected && id) {
-    if (d.status === "fulfilled") {
-      applyDetail(d.value);
-    } else if (d.reason.kind === "no_run") {
-      setState("detail-state", "error", `No such run: ${id}. It may have been removed.`);
-      $("detail").hidden = true;
+  try {
+    const id = state.selected;
+    // The auth mode decides whether Resume is offered, so it is known before the first render.
+    const [l, d] = await Promise.allSettled([
+      api("/api/runs"),
+      id ? api(`/api/runs/${enc(id)}`) : Promise.resolve(null),
+      state.auth === undefined ? api("/api/config").then((c) => (state.auth = c.auth || null)) : null,
+    ]);
+    let ok = true;
+    const expired = [l, d].some((x) => x.status === "rejected" && x.reason.kind === "session_expired");
+    if (l.status === "fulfilled") {
+      applyList(l.value.runs || []);
     } else {
       ok = false;
-      if (!state.view) setState("detail-state", "error", `Could not load run ${id}: ${d.reason.message}`, true);
+      if (state.runs === null) setState("runs-state", "error", `Could not load runs: ${l.reason.message}`, expired ? "signin" : true);
     }
-  }
-  if (ok) {
-    state.fails = 0;
-    state.lastGood = Math.floor(Date.now() / 1000);
-  } else {
+    if (id === state.selected && id) {
+      if (d.status === "fulfilled") {
+        applyDetail(d.value);
+      } else if (d.reason.kind === "no_run" || d.reason.status === 404 || (d.reason.kind === "usage" && d.reason.status === 400)) {
+        // An ID the server rejects as malformed is, to the operator, a run that does not exist.
+        setState("detail-state", "error", `No such run: ${id}. It may have been removed.`);
+        $("detail").hidden = true;
+      } else {
+        ok = false;
+        if (!state.view || expired) setState("detail-state", "error", `Could not load run ${id}: ${d.reason.message}`, expired ? "signin" : true);
+      }
+    }
+    if (ok) {
+      state.fails = 0;
+      state.lastGood = Math.floor(Date.now() / 1000);
+    } else {
+      state.fails++;
+    }
+    renderSync(ok ? "live" : "offline");
+  } catch (e) {
+    // A render bug must not leave the lock held and the poll timer dead.
     state.fails++;
-  }
-  renderSync(ok ? "live" : "offline");
-  state.refreshing = false;
-  if (state.again) {
-    state.again = false;
-    refresh();
-  } else {
-    schedule();
+    console.error("lmloop: refresh failed", e);
+    try {
+      renderSync("offline");
+    } catch (_) {
+      /* keep recovering */
+    }
+  } finally {
+    state.refreshing = false;
+    if (state.again) {
+      state.again = false;
+      refresh();
+    } else {
+      schedule();
+    }
   }
 }
 
@@ -353,10 +409,15 @@ function busyFor(id, action) {
   return DECISIONS.has(action) && [...DECISIONS].some((d) => state.inflight.has(`${id}:${d}`));
 }
 
+function actionInfo(v, a) {
+  if (a === "resume" && edge()) return { available: false, reason: OIDC_NO_RESUME };
+  return (v.actions && v.actions[a]) || { available: false, reason: "not reported by the server" };
+}
+
 function renderActions(v) {
   for (const a of ACTIONS) {
     const btn = document.querySelector(`[data-action="${a}"]`);
-    const info = (v.actions && v.actions[a]) || { available: false, reason: "not reported by the server" };
+    const info = actionInfo(v, a);
     const busy = busyFor(v.run_id, a);
     const usable = info.available && !busy;
     btn.setAttribute("aria-disabled", usable ? "false" : "true");
@@ -595,7 +656,7 @@ function openConfirm(action, invoker) {
   const v = state.view;
   if (!v || $("dlg").open) return;
   const c = CONFIRM[action];
-  const info = v.actions[action];
+  const info = actionInfo(v, action);
   state.dlg = { id: v.run_id, action, invoker };
   $("dlg-title").textContent = c.title;
   $("dlg-run").textContent = `Run ${v.run_id}`;
@@ -647,9 +708,9 @@ function renderFlash() {
 
 function request(id, action, note) {
   const base = `/api/runs/${enc(id)}`;
-  if (action === "resume") return post(`${base}/resume`);
-  if (DECISIONS.has(action)) return post(`${base}/decision`, { decision: action === "approve" ? "approved" : "changes_requested", note });
-  return post(`${base}/control`, { control: action });
+  if (action === "resume") return post(`${base}/resume`, {}, action);
+  if (DECISIONS.has(action)) return post(`${base}/decision`, { decision: action === "approve" ? "approved" : "changes_requested", note }, action);
+  return post(`${base}/control`, { control: action }, action);
 }
 
 function describe(action, r) {
@@ -686,7 +747,7 @@ async function confirmDialog() {
     return;
   }
   // Last check against the newest poll: never send what the server now refuses.
-  const live = state.view && state.view.run_id === d.id && state.view.actions[d.action];
+  const live = state.view && state.view.run_id === d.id && actionInfo(state.view, d.action);
   if (!live || !live.available) {
     $("dlg-err").textContent = `No longer available: ${live ? live.reason : "run changed"}.`;
     $("dlg-err").hidden = false;

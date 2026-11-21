@@ -92,6 +92,8 @@ Set `BIN` as in the build example above and provide the `manifest.json` describe
 
 `fixture-resume demo` continues a paused fixture run; its journal repair contract is under [Fixture-resume journal recovery](#fixture-resume-journal-recovery). The web command prints its loopback URL; open that address on the same machine. Its JSON API and page are fixture/operator tooling, not a production service. The server always binds only `127.0.0.1`, checks the exact `Host` on every request and same-origin `Origin` plus JSON content type for POST, emits no CORS permission, and applies a restrictive CSP and `no-store` response headers. Optional `--auth-file FILE` enables HTTP Basic auth for every route. The file must be a regular file owned by the current user, mode `0600`, at most 1024 bytes, containing one line `username:password` with both fields non-empty; one trailing newline is allowed. Do not put credentials in command-line arguments. Optional `--public-origin https://host[:port]` requires `--auth-file` and allows requests from that exact HTTPS origin when `Host` matches. Use it only behind a same-host TLS-terminating proxy that forwards the expected `Host` and, for POST, `Origin`; the proxy and TLS boundary are operator-managed. On the public origin a `GET` may omit `Origin`, because browsers do on top-level navigation. A present `Origin` must still equal the public origin, and `POST` always requires the exact `Origin`. A local TLS fixture with Chromium (not the deployed proxy) returned a 401 challenge, then an authenticated 200 for the page, assets and API. No deployed proxy/TLS setup was tested, and the setting does not add a non-loopback bind. There is no PWA, Android client or cluster browser access. Approval is a durable decision record only and does not move `HEAD`.
 
+**Android read aliases (additive).** The server also answers the reads Android's client makes, with the same Host/Origin guard: `GET /health`, `GET /api/config` (`poll_seconds` 5.0, `read_only` false) and `GET /api/runs/lmloop/<id>`. `/health` is the one route that skips Basic auth, because Android's setup probe sends no credentials; it still needs the exact `Host` (and any present `Origin`) and returns only fixed fields: `status` "ok", `auth` ("basic" or "none"), `oidc` false and `read_only` false. Every `/api/runs` row and the project view carry the original Rust fields plus `route_id`, `project` (always `lmloop`), `state`, `title` (the run id), `paused` and `stopping`. `state` is coarser than `phase`: `failed`, `interrupted`, `stopped` and a diagnostic `gate_finished` read `stopped`; `completed` only when a serial run is `complete` with all tasks done and no failure; an unverifiable `complete` reads `unknown`. Fields the Rust store lacks (iteration, plan, model, agent, commits) are omitted, not invented. The dashboard also accepts Android's `#lmloop/<runId>` hash. API `Basic` auth is unchanged. There is no bearer, device-token or OIDC support, and no Android app was run against it.
+
 For the command set and verified checkpoint limits, see [`compatibility.md`](compatibility.md).
 
 ### Native pilot run
@@ -199,13 +201,28 @@ Checked against `src/cli.rs` (`dispatch`) and `src/tui.rs`.
 - **List cap.** The run list is still capped to the newest 100 runs of the state root, and the checkout filter applies after the cap (`MAX_RUNS` in `src/operator.rs`). Use a dedicated pilot state root.
 - **Not tested here.** This doc pass reran no tests and launched no pilot.
 
+### Auth edge, units and CI
+
+Checked against `edge/gateway.py`, `deploy/`, `.gitea/workflows/rust-ci.yml` and `web/app.js`. The source and tests have passed the checks listed under [Verification](#verification). That establishes source readiness only: nothing is installed, enabled or running, and no real issuer, proxy or Android device has been tried.
+
+- **Edge.** `edge/gateway.py` is a loopback-only Python server that sits between a TLS proxy and the Rust backend. It reuses `web/auth.py` (OIDC) and `web/device_auth.py` unchanged and needs `PyJWT` and `requests`. `--check` validates the whole configuration without binding or touching the network. Secrets come from `env:`/`file:` references, never argv.
+- **Identity.** The OIDC `sub` must be on the required `LMLOOP_EDGE_OPERATOR_SUBS` allowlist, at the callback and on every request. Optional Android bearer tokens (`LMLOOP_EDGE_DEVICE_TOKENS`) are read-only: `GET /api/config`, `/api/runs` and `/api/runs/lmloop/<id>`, and never a write.
+- **Routes.** A closed allowlist; everything else is 404. Open: `/health` (fixed JSON with `auth` "oidc" and `read_only` true, no upstream call), `/login`, `/login/start`, `/oauth/callback`, `/logout`. Session only: `/`, `/app.css`, `/app.js`, `/api/runs/<id>`, log reads (`bytes` up to 65536), `POST …/control` (`pause`, `stop`, `stop_now`) and `POST …/decision` (`approved` or `changes_requested`, note up to 2000 bytes). There is no resume. A write needs the session cookie, the exact public `Origin`, a same-origin `Sec-Fetch-Site`, a matching `X-CSRF-Token` and a JSON body. Approvals stay recorded-only: the edge adds no approval power.
+- **Upstream.** Each request is rebuilt from scratch with fixed headers and the Basic credential from the backend's `0600` auth file. Redirects are not followed, and status, content type and size (1 MiB) are checked. A request has a 30 s deadline, and 16 run at once. `/api/config` gains `user`, `csrf`, `auth` and `oidc`, and `read_only` is true for a bearer.
+- **Dashboard.** `web/app.js` fetches `/api/config` before each mutation to get the CSRF token, never stores it, hides Resume behind the edge, and shows a sign-in prompt when the session has expired. A Basic 401 keeps its browser credential prompt.
+- **Units.** `deploy/` holds `lmloop-rust-web.service`, `lmloop-rust-edge.service`, `edge.env.example` and a README. They are user units that run from an immutable release under `~/lmloop-rust/current` with fresh state, and touch nothing of the Python `lmloop-web` unit. Both bind loopback only. `edge.env.example` holds placeholders, no secret values.
+- **CI.** `.gitea/workflows/rust-ci.yml` is configured to run fmt, locked clippy, tests and build, the Node checks, the edge tests against the built backend and the SSE adapter tests on pull requests and pushes to `main` that touch `rust/**`, `*.py` or `web/**`. Its source checks passed locally as listed under [Verification](#verification); hosted-runner execution is not verified.
+- **Open blockers.** (1) A real Caddy on another host reaching the edge's loopback needs an authenticated private transport; the deploy README lists options and none is configured. (2) The operator OIDC subject and the Vault references for the secrets are not set up.
+- **Name mismatch.** The units, cookie names (`lmloop_preview_session`) and example client id say "preview". Pierce asked for the existing live URL on `main`, with no preview. That wording needs reconciling before any rollout.
+- **Python unit.** The old Python unit is removed only after an authenticated Rust cutover, and none has happened.
+
 ### Cutover status
 
-**No cutover has been performed.** Python lmloop remains the production path, and nothing here replaces or deploys over it. Before any cutover:
+**No cutover has been performed.** Python lmloop remains the production path, and nothing here replaces or deploys over it. Pierce wants `main` and the existing live URL, not a preview, and the Python unit removed only after an authenticated Rust cutover. Before any cutover:
 
 - The production Rust `run` path is disabled (exit 69 without `--manifest`). Only the experimental one-shot pilot exists, as `pilot-run` or `run --manifest`. Its small no-skill live run committed, and the sixth Museum live attempt passed under the watchdog (one run). The first five Museum attempts failed (exit 10, no commit; the fourth, with longer caps, ended on an incomplete stream, and the fifth timed out at the 3600 s worker backstop after a late write to `index.html`).
 - **Decision (Pierce): OIDC and Android are retained.** Both must be carried over before the Python service is swapped, and Python baseline changes stay additive only. Neither is done in Rust.
-- The Rust web console binds loopback only and offers optional Basic auth plus an HTTPS-origin check for a same-host TLS proxy; it does not provide Python's OIDC, device-token, CSRF and read-only modes. Only a local TLS fixture has been tried, not a deployed proxy. See [`compatibility.md`](compatibility.md).
+- The Rust binary binds loopback only and offers optional Basic auth plus an HTTPS-origin check for a same-host TLS proxy; it does not provide Python's OIDC, device-token, CSRF and read-only modes itself. The edge above supplies these paths in source, but it is unproven against a real issuer, proxy and device. Android's `/health`, `/api/config` and run-view reads have additive aliases (see the web paragraph above). Only a local TLS fixture has been tried, not a deployed proxy. See [`compatibility.md`](compatibility.md).
 - There is no legacy state migration: Rust starts from fresh state only and reads no Python run, config or state data.
 
 ## Commands and exit codes
@@ -259,16 +276,23 @@ Checked against `src/cli.rs` (`EXIT_*` constants and the `after_help` text). Cod
 
 ## Verification
 
-Reported by the parent session and QA for this worktree. The doc pass did not rerun them. The parent's last run covered locked offline fmt, clippy, build and the 114 offline Rust tests below, plus 14 Python adapter tests for `tools/sse_progress.py` and a JS syntax check. None of them use a live model. Earlier counts (M1, 85, 93, 98) are historical, not current totals. The 114 figure predates the `run --manifest` tests: a static count finds 49 `#[test]` attributes in `tests/serial.rs` (the table says 47), so the current total is likely higher, but the doc pass was given no new run result and claims none.
+Reported by the parent session and QA for this worktree. The doc pass did not rerun them. None of them use a live model. Earlier counts (M1, 85, 93, 98, 114) are historical, not current totals.
+
+**Latest parent verification (offline/local):** under `umask 022`, all 118 locked Rust tests passed after the CLI fixtures were fixed to create private state directories explicitly. `cargo fmt --check` and locked Clippy passed. `/usr/bin/python3 edge/test_gateway.py` passed 30 tests, including real-Rust integration; `python3 -m unittest rust/tools/test_sse_progress.py` passed 14; Node passed 10 tests in `web/app.csrf.test.js`, and `node --check rust/web/app.js` passed. These checks establish source readiness only. They do not establish a hosted Gitea CI run, installed units, or a live issuer/proxy/device deployment.
+
+A separate scratch run under `/tmp/opencode/lm1x4-proof/` (parent-reported; the doc pass did not read its logs, which hold fixture secrets) passed 51 fixture checks. It exercised the real Python OIDC and device-token verifier and the Rust backend over loopback fixture TLS, `GET` only. It used no real issuer, no real proxy and no Android app, so it is not deployed-edge or device evidence.
 
 | Check | Result |
 |---|---|
-| `cargo fmt --check` | pass (final parent run) |
-| `cargo clippy --locked --all-targets -- -D warnings` | pass (final parent run) |
-| `cargo test --locked` | 114 tests in total, all passing (11 lib, 24 CLI, 15 Git snapshot, 47 serial, 11 TUI, 6 web) |
+| `cargo fmt --check` | pass (parent-verified) |
+| `cargo clippy --locked --all-targets -- -D warnings` | pass (parent-verified) |
+| `cargo test --locked` (under `umask 022`) | 118 tests passed after explicit private scratch-state directory fix (12 lib, 24 CLI, 15 Git snapshot, 49 serial, 11 TUI, 7 web) |
 | `cargo build --locked` | pass |
-| `python3 -m unittest rust/tools/test_sse_progress.py` | 14 adapter tests, parent-reported pass |
-| JS syntax (`node --check web/app.js`) | pass |
+| `/usr/bin/python3 rust/edge/test_gateway.py` | 30 passed, including real-Rust integration |
+| `python3 -m unittest rust/tools/test_sse_progress.py` | 14 passed |
+| `node --test rust/web/app.csrf.test.js` | 10 passed |
+| `node --check rust/web/app.js` | pass |
+| Hosted Gitea workflow / installed units / live issuer-proxy-device | Not verified |
 | QA fixture exercise | Real paused → resume → approve flow passed; approval left `HEAD` unchanged. Guarded local API checks passed. |
 | Visual review | Desktop and mobile Chromium review; keyboard and reduced-motion checks. See [`web/design/visual-review.md`](web/design/visual-review.md) for limits and scope. |
 
@@ -299,5 +323,9 @@ Checked against `src/protocol.rs` (`recover`, `scan`, `archive_tail`) and `src/s
 | `src/gate.rs` | Gate execution, outcomes, signal handling, bounded capture, log files |
 | `tools/sse_progress.py`, `tools/test_sse_progress.py` | Count-only SSE progress beacon for the opt-in worker watchdog, and its offline tests |
 | `tests/` | CLI, Git snapshot, serial fixture, TUI and web tests |
+| `edge/gateway.py`, `edge/test_gateway.py` | OIDC/bearer edge in front of the backend, and its tests |
+| `deploy/` | User units, `edge.env.example` and deploy README |
+| `web/app.csrf.test.js` | Node tests for CSRF, expired-session and refresh behaviour in `web/app.js` |
+| `../.gitea/workflows/rust-ci.yml` | Gitea CI workflow; source checks passed locally, hosted run unverified |
 
-Beads: `lm-1x4` (epic) remains in progress. This checkpoint records fixture M2/M3 evidence, one offline real-OpenCode pilot, one small no-skill live run that committed, five Museum live attempts that failed with exit 10 (three timeouts, a longer-cap run that ended on an incomplete stream, then a 3600 s worker timeout after a late `index.html` write with no gate run), and a sixth that passed under the watchdog (`fffece2`, 5,213 s, 4,422 model pulses, desktop and mobile gate pass). Under the updated acceptance gate (fresh Rust state, no legacy import or migration/rollback rehearsal), the epic's native CLI/TUI/dashboard, project/API/auth (OIDC retained)/PWA/Android (retained)/fixture CI criteria are not met, and the live-model pilot has one passing run, not a repeatable result. `lm-pzi` is closed. `lm-pv8` and `lm-pv8.1` remain in progress and are unaffected. Android/PWA compatibility is tracked separately as `lm-2bk` and `lm-xw1.7`.
+Beads: `lm-1x4` (epic) remains in progress. This checkpoint records fixture M2/M3 evidence, one offline real-OpenCode pilot, one small no-skill live run that committed, five Museum live attempts that failed with exit 10 (three timeouts, a longer-cap run that ended on an incomplete stream, then a 3600 s worker timeout after a late `index.html` write with no gate run), and a sixth that passed under the watchdog (`fffece2`, 5,213 s, 4,422 model pulses, desktop and mobile gate pass). Under the updated acceptance gate (fresh Rust state, no legacy import or migration/rollback rehearsal), the epic's native CLI/TUI/dashboard, project/API/auth (OIDC retained)/PWA/Android (retained)/fixture CI criteria are not met, and the live-model pilot has one passing run, not a repeatable result. `lm-pzi` is closed. `lm-pv8` and `lm-pv8.1` remain in progress and are unaffected. Android/PWA compatibility is tracked separately as `lm-2bk` and `lm-xw1.7`. Since then source has added an OIDC/bearer edge, user units and a CI workflow (see [Auth edge, units and CI](#auth-edge-units-and-ci)); the source checks are recorded above; no live issuer, proxy or device test has been performed.

@@ -1,0 +1,80 @@
+name: Rust CI
+
+on:
+  pull_request:
+    paths:
+      - 'rust/**'
+      - '*.py'
+      - 'web/**'
+      - '.gitea/workflows/rust-ci.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'rust/**'
+      - '*.py'
+      - 'web/**'
+      - '.gitea/workflows/rust-ci.yml'
+
+permissions:
+  contents: read
+jobs:
+  test:
+    # Same runner label as Python CI: an Alpine (musl) python container running as
+    # root, with no Rust, Node or C linker. They are provisioned below; outbound
+    # access on this runner is limited to 80/443, which every step here uses.
+    runs-on: python-3.12
+    timeout-minutes: 30
+    env:
+      RUST_VERSION: '1.100.0'
+      # rustup-init 1.28.2, x86_64-unknown-linux-musl (checked against
+      # static.rust-lang.org/rustup/archive/1.28.2/.../rustup-init.sha256).
+      RUSTUP_INIT_SHA256: e6599a1c7be58a2d8eaca66a80e0dc006d87bbcf780a58b7343d6e14c1605cb2
+    steps:
+      - uses: builtin:checkout
+      - name: Provision Node, git, a C linker and the pinned Rust toolchain
+        run: |
+          set -eu
+          apk add --no-cache git nodejs build-base curl
+          curl -fsSL -o /tmp/rustup-init \
+            https://static.rust-lang.org/rustup/archive/1.28.2/x86_64-unknown-linux-musl/rustup-init
+          echo "$RUSTUP_INIT_SHA256  /tmp/rustup-init" | sha256sum -c -
+          chmod +x /tmp/rustup-init
+          /tmp/rustup-init -y --no-modify-path --profile minimal \
+            --default-toolchain "$RUST_VERSION" -c rustfmt -c clippy
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Set job-local Git identity for repository tests
+        run: |
+          git config --global user.name 'CI'
+          git config --global user.email 'ci@example.invalid'
+      - name: Verify toolchain
+        run: |
+          set -eu
+          test "$(rustc --version | cut -d' ' -f2)" = "$RUST_VERSION"
+          cargo fmt --version
+          cargo clippy --version
+          node --version
+          python3 --version
+      # Same ranges as pyproject.toml's web extra; the edge reuses web/auth.py.
+      - run: python3 -m pip install 'PyJWT[crypto]>=2.7,<3' 'requests>=2.31,<3'
+      - name: Rust fmt, clippy, tests
+        working-directory: rust
+        run: |
+          set -eu
+          cargo fmt --check
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo test --locked
+      # The edge contract tests drive rust/target/debug/lmloop and skip without it.
+      - name: Build the backend the edge test uses
+        working-directory: rust
+        run: cargo build --locked
+      - name: Node
+        run: |
+          set -eu
+          node --check rust/web/app.js
+          node --test rust/web/app.csrf.test.js
+      - name: Python edge against the built backend
+        run: |
+          set -eu
+          test -x rust/target/debug/lmloop
+          python3 rust/edge/test_gateway.py
+          python3 -m unittest rust/tools/test_sse_progress.py

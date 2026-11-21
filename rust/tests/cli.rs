@@ -16,7 +16,9 @@ impl Scratch {
             .map_or_else(|| PathBuf::from("/tmp/opencode"), PathBuf::from);
         let dir = base.join(format!("lmloop-it-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(dir.join("state")).unwrap();
+        // Explicit 0700: the binary refuses a group-writable state root, and
+        // the inherited umask (e.g. 0002 in CI) would create one.
+        mkdirs(&dir.join("state"));
         Self(dir)
     }
     fn state(&self) -> PathBuf {
@@ -701,7 +703,16 @@ fn state_files_must_be_private_regular_files() {
 #[test]
 fn pipe_held_by_an_escaped_descendant_keeps_partial_output_and_flags_it() {
     let s = Scratch::new("escaped");
-    let sh = s.script("esc.sh", "echo before-escape; setsid sleep 6 &\nexit 0");
+    // The marker is written after setsid, so the gate's group sweep cannot
+    // catch the child mid-escape and close the pipe it is meant to hold.
+    let marker = s.0.join("escaped");
+    let sh = s.script(
+        "esc.sh",
+        &format!(
+            "echo before-escape\nsetsid sh -c 'echo $$ > {m}; exec sleep 6' &\nwhile [ ! -s {m} ]; do sleep 0.05; done\nexit 0",
+            m = marker.display()
+        ),
+    );
     let started = Instant::now();
     let out = gate(&s, "r", &[], &[&sh]);
     assert!(started.elapsed() < Duration::from_secs(5));
