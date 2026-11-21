@@ -1,0 +1,6 @@
+#!/bin/sh
+# Operator gate: runs in the exported tree; fails if any file says FAIL.
+# A file named HANG blocks the gate; MUTATE makes it rewrite the export in place (same length).
+[ -e HANG ] && exec sleep 300
+[ -e MUTATE ] && printf 'y\n' > MUTATE
+! grep -rq FAIL .

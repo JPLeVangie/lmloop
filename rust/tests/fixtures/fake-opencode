@@ -1,0 +1,45 @@
+#!/bin/sh
+# Fixture stand-in for `opencode run --format json`. Last argument: "MODE|path|content".
+# Runs with the repo as cwd, stdin null and a scrubbed environment.
+IFS='|' read -r mode path content <<EOP
+$1
+EOP
+sid="ses_$(date +%s%N)_$$"
+ev() { printf '{"type":"%s","sessionID":"%s","part":{"reason":"%s"}}\n' "$1" "$sid" "$2"; }
+write() { mkdir -p "$(dirname "$path")" && printf '%s\n' "$content" > "$path"; }
+case "$mode" in
+  ok)        ev step_start ""; write; ev tool_use ""; ev step_finish stop ;;
+  samesid)   sid=ses_fixed; ev step_start ""; write; ev step_finish stop ;;
+  nostop)    ev step_start ""; write; ev step_finish tool-calls ;;
+  nosession) write; printf '{"type":"step_finish","part":{"reason":"stop"}}\n' ;;
+  silent)    write ;;
+  error)     ev step_start ""; write; ev error ""; ev step_finish stop ;;
+  exit1)     ev step_start ""; write; ev step_finish stop; exit 1 ;;
+  exit127)   write; exit 127 ;;
+  slow)      write; sleep 30 ;;
+  # content is a control file to create mid-task (the task still finishes cleanly)
+  ctl)       ev step_start ""; write; : > "$content"; ev step_finish stop ;;
+  # content is a pid file: a descendant and the leader both block until torn down
+  hang)      ev step_start ""; write; sleep 300 & echo $! > "$content"; sleep 300 ;;
+  # a clean worker that leaves a descendant (holding our stdout) behind
+  bg)        ev step_start ""; write; sleep 300 & echo $! > "$content"; ev step_finish stop ;;
+  # Watchdog modes: content is the progress file a trusted bridge would append `model` records to.
+  # A model record every 0.5s for 4s, then a clean stop (longer than a 2s idle window)
+  pulse)     ev step_start ""; write; i=0; while [ $i -lt 8 ]; do sleep 0.5; printf 'model\n' >> "$content"; i=$((i+1)); done; ev tool_use ""; ev step_finish stop ;;
+  # Records forever, so only a hard cap or STOP-NOW ends it
+  forever)   ev step_start ""; write; while :; do sleep 0.2; printf 'model\n' >> "$content"; done ;;
+  # Never a model record
+  stall)     ev step_start ""; write; sleep 30 ;;
+  # One record, then silence
+  pulse1)    ev step_start ""; write; printf 'model\n' >> "$content"; sleep 30 ;;
+  # Lots of stdout (keepalive-like noise) and no model records at all
+  noise)     ev step_start ""; write; while :; do ev text ""; sleep 0.05; done ;;
+  # A record that is not `model`
+  badsrc)    ev step_start ""; write; printf 'junk\n' >> "$content"; sleep 30 ;;
+  # Two records, then the file is truncated under the supervisor
+  trunc)     ev step_start ""; write; printf 'model\nmodel\n' >> "$content"; sleep 0.6; : > "$content"; sleep 30 ;;
+  # The same completed tool call, same result, nothing changing, four times, with model records
+  loop)      ev step_start ""; write; printf 'model\n' >> "$content"; i=0; while [ $i -lt 4 ]; do printf '{"type":"tool_use","sessionID":"%s","part":{"tool":"read","state":{"status":"completed","input":{"path":"a"},"output":"same"}}}\n' "$sid"; sleep 0.1; i=$((i+1)); done; sleep 1; printf 'model\n' >> "$content"; ev step_finish stop ;;
+  # Over 128 KiB of valid stdout, then a clean stop
+  big)       ev step_start ""; write; i=0; while [ $i -lt 3000 ]; do printf '{"type":"text","sessionID":"%s","part":{"text":"%0100d"}}\n' "$sid" 0; i=$((i+1)); done; ev step_finish stop ;;
+esac
