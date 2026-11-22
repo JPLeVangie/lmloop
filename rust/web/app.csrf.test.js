@@ -30,7 +30,8 @@ function load(config, extra = {}) {
       getElementById: (id) => els[id] || node(),
       querySelector: node,
       querySelectorAll: () => [],
-      createElement: extra.els ? () => ({ addEventListener(_, f) { this.click = f; } }) : node,
+      createElement: extra.createElement || (extra.els ? () => ({ addEventListener(_, f) { this.click = f; } }) : node),
+      get activeElement() { return extra.activeElement; },
       createTextNode: extra.els ? (text) => ({ text }) : node,
       addEventListener() {},
       body: { dataset: {} },
@@ -51,7 +52,7 @@ function load(config, extra = {}) {
     },
   };
   vm.createContext(ctx);
-  vm.runInContext(fs.readFileSync(path.join(__dirname, "app.js"), "utf8") + "\n;globalThis.__t = { post, request, api, refresh, state, normalizeOptions, objectiveGap, launchRun, submitLaunch, loadLaunchOptions };", ctx);
+  vm.runInContext(fs.readFileSync(path.join(__dirname, "app.js"), "utf8") + "\n;globalThis.__t = { post, request, api, refresh, state, groupRuns, renderRuns, normalizeOptions, objectiveGap, launchRun, submitLaunch, loadLaunchOptions };", ctx);
   const settle = async () => {
     for (let i = 0; i < 50 && ctx.__t.state.refreshing; i++) await new Promise((r) => setImmediate(r));
   };
@@ -390,4 +391,79 @@ test("launch: missing /api/launch-options reads as disabled", async () => {
   assert.equal(t.state.launch.status, "ready");
   assert.equal(t.state.launch.enabled, false);
   assert.deepEqual(t.state.launch.opts, []);
+});
+
+/* ───── run grouping ───── */
+// Minimal element tree: enough to read back what renderRuns built.
+function fakeEl(tag) {
+  return {
+    tag, className: "", dataset: {}, attrs: {}, kids: [], _text: "",
+    set textContent(v) { this._text = String(v); },
+    get textContent() { return this._text + this.kids.map((k) => k.textContent).join(""); },
+    setAttribute(k, v) { this.attrs[k] = v; },
+    append(...k) { this.kids.push(...k); },
+    replaceChildren(...k) { this.kids = k; },
+    contains(n) { return n === this || this.kids.some((k) => k.contains && k.contains(n)); },
+    querySelectorAll() { const out = []; walk(this, (n) => n.dataset && n.dataset.fk && out.push(n)); return out; },
+    focus() { this.focused = true; },
+  };
+}
+const run = (id, phase, extra = {}) => ({ run_id: id, kind: "serial_fixture", phase, owner_lost: false, tasks_done: 0, tasks_total: 1, lease: { state: "free" }, pending_controls: [], ...extra });
+const walk = (n, f) => { f(n); for (const k of n.kids || []) walk(k, f); };
+
+test("run grouping: phase decides the group, server order is kept, nothing is dropped", () => {
+  const t = load({});
+  const runs = [
+    run("a", "worker"), run("b", "complete"), run("c", "paused"), run("d", "failed"), run("e", "gate_running", { kind: "diagnostic_gate" }),
+    run("f", "interrupted", { kind: "diagnostic_gate" }), run("g", "invalid", { kind: "invalid" }), run("h", "stopped"), run("i", "idle"), run("j", "committing"), run("k", "brand_new_phase"),
+  ];
+  const g = t.groupRuns(runs);
+  assert.deepEqual(g.active.map((r) => r.run_id), ["a", "c", "e", "i", "j"]);
+  assert.deepEqual(g.history.map((r) => r.run_id), ["b", "d", "f", "g", "h", "k"]);
+  // owner_lost does not move a run: it is still the phase it was persisted in
+  const lost = t.groupRuns([run("x", "worker", { owner_lost: true }), run("y", "complete", { owner_lost: true })]);
+  assert.deepEqual([lost.active.length, lost.history.length], [1, 1]);
+  // the 100-run cap is the server's; grouping keeps every row it was given
+  const many = Array.from({ length: 100 }, (_, i) => run(`r${i}`, i % 3 ? "complete" : "paused"));
+  const m = t.groupRuns(many);
+  assert.equal(m.active.length + m.history.length, 100);
+});
+
+test("run list renders labelled groups, truthful badges, and keeps focus keys across a regroup", () => {
+  const box = fakeEl("div");
+  const note = fakeEl("span");
+  const extra = { els: { runs: box, "runs-count": note }, createElement: fakeEl };
+  const t = load({}, extra);
+  t.state.runs = [run("p1", "paused", { pending_controls: ["STOP"] }), run("l1", "worker", { owner_lost: true, lease: { state: "stale", pid: 7 } }), run("h1", "complete")];
+  t.state.selected = "l1";
+  t.renderRuns();
+  const groups = box.kids;
+  assert.deepEqual(groups.map((x) => x.kids[0].textContent), ["Active2", "History1"]);
+  const rows = (grp) => grp.kids[2].kids.map((li) => li.kids[0]);
+  assert.deepEqual(rows(groups[0]).map((a) => a.dataset.fk), ["p1", "l1"]);
+  assert.deepEqual(rows(groups[1]).map((a) => a.dataset.fk), ["h1"]);
+  const [, lostRow] = rows(groups[0]);
+  assert.equal(lostRow.attrs["aria-current"], "true");
+  const labels = [];
+  walk(lostRow, (n) => n.className.startsWith("badge") && labels.push(n.textContent));
+  assert.deepEqual(labels, ["worker", "owner lost"]);
+  const text = (a) => a.textContent;
+  assert.match(text(rows(groups[0])[0]), /paused/);
+  assert.match(text(rows(groups[0])[0]), /pending STOP/);
+  assert.match(text(lostRow), /lease stale \(was pid 7\)/);
+  // a poll that finishes the run regroups it; same list => no rebuild
+  const before = box.kids;
+  t.renderRuns();
+  assert.equal(box.kids, before);
+  t.state.runs = [run("p1", "paused", { pending_controls: ["STOP"] }), run("l1", "failed"), run("h1", "complete")];
+  extra.activeElement = lostRow; // keyboard focus is on l1 while the poll moves it Active -> History
+  t.renderRuns();
+  const moved = box.querySelectorAll().find((n) => n.dataset.fk === "l1");
+  assert.ok(moved !== lostRow && moved.focused, "focus follows the run into its new group");
+  extra.activeElement = undefined;
+  assert.deepEqual(box.kids.map((x) => x.kids[0].textContent), ["Active1", "History2"]);
+  // an empty group is omitted rather than shown as a zero heading
+  t.state.runs = [run("h1", "complete")];
+  t.renderRuns();
+  assert.deepEqual(box.kids.map((x) => x.kids[0].textContent), ["History1"]);
 });

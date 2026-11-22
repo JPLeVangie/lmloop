@@ -322,7 +322,7 @@ function schedule() {
 function applyList(runs) {
   state.runs = runs;
   setState("runs-state", runs.length ? null : "empty", "No runs in this state root yet. Use New run to start one from an approved policy, or use the CLI.");
-  $("runs-count").textContent = runs.length ? `${runs.length} newest first${runs.length >= 100 ? " (list capped at 100)" : ""}` : "";
+  $("runs-count").textContent = runs.length ? `${runs.length} newest first${runs.length >= 100 ? " (capped at 100 in total; older runs, active or not, are not listed)" : ""}` : "";
   if (!state.autoPicked && !state.selected && runs.length && matchMedia("(min-width: 960px)").matches) {
     state.autoPicked = true;
     location.replace(`#/run/${enc(runs[0].run_id)}`);
@@ -332,31 +332,62 @@ function applyList(runs) {
   renderRuns();
 }
 
+// Unfinished phases, from engine RunPhase and the diagnostic Phase. A lost owner never moves a run
+// by itself: serial runs stay in worker/gate/committing, and a diagnostic gate whose owner died is
+// already reported by the server as the terminal `interrupted`. Unknown phases are not claimed active.
+const ACTIVE_PHASES = new Set(["idle", "worker", "gate", "committing", "paused", "gate_running"]);
+const RUN_GROUPS = [
+  { key: "active", title: "Active", note: "Unfinished runs, including paused ones and any whose owner is lost." },
+  { key: "history", title: "History", note: "Complete, failed, stopped, interrupted, unreadable or unrecognised." },
+];
+/** Split by phase only, keeping the server's newest-first order inside each group. */
+function groupRuns(runs) {
+  const g = { active: [], history: [] };
+  for (const r of runs) g[ACTIVE_PHASES.has(r.phase) ? "active" : "history"].push(r);
+  return g;
+}
+
+function runRow(r) {
+  const li = el("li");
+  const a = el("a", "run");
+  a.href = `#/run/${enc(r.run_id)}`;
+  a.dataset.fk = r.run_id;
+  if (r.run_id === state.selected) a.setAttribute("aria-current", "true");
+  const head = el("span", "run-id", r.run_id);
+  const badges = el("span", "run-badges");
+  badges.append(phaseBadge(r));
+  if (r.owner_lost) badges.append(badge("owner lost", "lost"));
+  const meta = el("span", "run-meta");
+  meta.append(
+    el("span", null, r.kind.startsWith("serial_") ? `${r.tasks_done}/${r.tasks_total} tasks` : words(r.kind)),
+    el("span", null, `lease ${leaseText(r.lease)}`),
+  );
+  if (r.pending_controls && r.pending_controls.length) meta.append(el("span", null, `pending ${r.pending_controls.join(", ")}`));
+  a.append(head, badges, meta);
+  if (r.failure || r.problem) a.append(el("span", "run-fail", r.failure || r.problem));
+  li.append(a);
+  return li;
+}
+
 function renderRuns() {
   const box = $("runs");
   const runs = state.runs || [];
-  rebuild(box, JSON.stringify([runs, state.selected]), () =>
-    runs.map((r) => {
-      const li = el("li");
-      const a = el("a", "run");
-      a.href = `#/run/${enc(r.run_id)}`;
-      a.dataset.fk = r.run_id;
-      if (r.run_id === state.selected) a.setAttribute("aria-current", "true");
-      const head = el("span", "run-id", r.run_id);
-      const b = phaseBadge(r);
-      if (r.owner_lost) b.after(badge("owner lost", "lost"));
-      const meta = el("span", "run-meta");
-      meta.append(
-        el("span", null, r.kind.startsWith("serial_") ? `${r.tasks_done}/${r.tasks_total} tasks` : words(r.kind)),
-        el("span", null, `lease ${leaseText(r.lease)}`),
-      );
-      if (r.pending_controls && r.pending_controls.length) meta.append(el("span", null, `pending ${r.pending_controls.join(", ")}`));
-      a.append(head, b, meta);
-      if (r.failure || r.problem) a.append(el("span", "run-fail", r.failure || r.problem));
-      li.append(a);
-      return li;
-    }),
-  );
+  // One container for both groups so focus on a row survives it moving between them.
+  rebuild(box, JSON.stringify([runs, state.selected]), () => {
+    const groups = groupRuns(runs);
+    return RUN_GROUPS.filter((g) => groups[g.key].length).map((g) => {
+      const sec = el("div", "run-group");
+      sec.setAttribute("role", "group");
+      sec.setAttribute("aria-labelledby", `runs-g-${g.key}`);
+      const h = el("h3", null, g.title);
+      h.id = `runs-g-${g.key}`;
+      h.append(el("span", "tally", String(groups[g.key].length)));
+      const ul = el("ul", "runs");
+      ul.append(...groups[g.key].map(runRow));
+      sec.append(h, el("p", "note", g.note), ul);
+      return sec;
+    });
+  });
 }
 
 /* ───── run detail ───── */
