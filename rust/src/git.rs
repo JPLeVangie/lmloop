@@ -283,6 +283,24 @@ pub fn toplevel(cwd: &Path) -> Option<PathBuf> {
     fs::canonicalize(root).ok()
 }
 
+/// The worktree-specific Git directory of `cwd` (a linked worktree has its own), read-only.
+/// `Ok(None)` only when git says `cwd` is not in a repository; any other failure is an error,
+/// so a caller never skips exclusion because a lookup went wrong.
+pub fn checkout_dir(cwd: &Path) -> Result<Option<PathBuf>> {
+    let out = run(cwd, None, &["rev-parse", "--absolute-git-dir"], None)?;
+    if !out.status.success() {
+        let why = brief(&out.stderr);
+        if why.contains("not a git repository") {
+            return Ok(None);
+        }
+        return Err(err("git", format!("rev-parse --absolute-git-dir: {why}")));
+    }
+    let dir = text(&out.stdout);
+    fs::canonicalize(&dir)
+        .map(Some)
+        .map_err(|e| err("git", format!("canonicalize {dir}: {e}")))
+}
+
 impl Repo {
     /// Validate an ordinary attached branch with a clean, fully-visible baseline.
     pub fn open(path: &Path) -> Result<Self> {

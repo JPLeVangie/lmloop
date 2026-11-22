@@ -211,7 +211,7 @@ pub struct Receipt {
 #[derive(Debug, Clone, Serialize)]
 pub struct ResumeOutcome {
     pub run_id: String,
-    /// complete | task_failed | stopped | paused | owned_elsewhere | needs_reconciliation | no_run | usage
+    /// complete | task_failed | stopped | paused | owned_elsewhere | checkout_busy | needs_reconciliation | no_run | usage
     pub outcome: &'static str,
     pub message: String,
 }
@@ -677,6 +677,10 @@ fn outcome(run_id: String, f: Finish, pilot: bool) -> ResumeOutcome {
         Finish::OwnedElsewhere => (
             "owned_elsewhere",
             "owned by another process; nothing was changed".into(),
+        ),
+        Finish::CheckoutBusy => (
+            "checkout_busy",
+            "another lmloop process holds this Git checkout; the journal, run.json and Git were not changed".into(),
         ),
         Finish::NeedsReconciliation(m) => ("needs_reconciliation", clean(&m, false)),
         Finish::NoRun => ("no_run", "no such fixture run".into()),

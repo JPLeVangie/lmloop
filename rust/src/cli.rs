@@ -368,6 +368,12 @@ fn finish(id: &str, f: Finish) -> Result<u8, Error> {
             eprintln!("lmloop: run {id} is owned by another process; nothing was changed");
             EXIT_OWNED_ELSEWHERE
         }
+        Finish::CheckoutBusy => {
+            eprintln!(
+                "lmloop: run {id}: another lmloop process holds this Git checkout; the journal, run.json and Git were not changed"
+            );
+            EXIT_OWNED_ELSEWHERE
+        }
         Finish::NeedsReconciliation(m) => {
             eprintln!("lmloop: {m}");
             EXIT_NEEDS_RECONCILIATION

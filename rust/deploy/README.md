@@ -88,7 +88,10 @@ run](../README.md#native-pilot-run), [Basic TUI](../README.md#basic-tui),
 - `202` means the run was published. `504` means the outcome is uncertain. Check the run list. Nothing retries automatically.
 - STOP-NOW takes effect immediately, except while a commit is being published.
 - Failed or stopped edits are kept. There is no resume, merge or deploy.
-- One run slot per server process. It is not a cross-process checkout lock, so two servers can still collide on one checkout.
+- One run slot per server process. Separately, an advisory, nonblocking lock (`lmloop-checkout.lock` in the worktree's own Git directory) excludes a second run on the same Git worktree across Rust processes and state roots. Linked worktrees have separate Git directories, so they are independent.
+- A busy checkout returns a typed `409` (`busy`) before launch, with no run directory created. A standalone resume that may write also returns `409` when the checkout is held. The run's own lease metadata may still be updated on a busy resume.
+- The lock file is never unlinked or truncated, and a symlinked or hard-linked one is refused.
+- **Limit.** The lock is advisory and dies with the process that holds it. It does not protect against a worker orphaned after its launcher dies, or against arbitrary Git writers that never take it. No NFS or other network filesystem was verified.
 - The worker edits the approved checkout in place. The review screen says so and labels the field "Policy revision".
 
 **Production gate.** All of these must hold before this runs in a live unit, and Pierce must approve it:
@@ -96,7 +99,7 @@ run](../README.md#native-pilot-run), [Basic TUI](../README.md#basic-tui),
 - A pinned, isolated launcher and relay that protect state, auth and config, and make no auxiliary inference calls.
 - A fresh watchdog file for each run, provisioned per run. A nonempty or unusable file is rejected. A static path passes if the file is zero-byte, but production still requires a fresh file each run.
 - Immutable gate and tooling.
-- An exclusive checkout, with cross-process exclusion.
+- An exclusive checkout. The advisory lock above is not enough: it cannot stop an orphaned worker or an arbitrary Git writer.
 - Policy approval and a rollout decision.
 
 **Tested so far.** Parent-verified final pass, after the follow-ups above landed. All of it is scratch and local; none of it ran in a live unit.
@@ -104,5 +107,6 @@ run](../README.md#native-pilot-run), [Basic TUI](../README.md#basic-tui),
 - Full local suite green: `cargo fmt --check`, `clippy -D warnings`, 140 Rust tests (15 in web), gateway 41 (including a real-Rust dirty-checkout refusal with HEAD and the edit preserved), `sse_progress` 14, Node 29, `git diff --check` clean.
 - Fresh Chromium rerun against the rebuilt binary, at 390x844 and 1440x900: one POST returning 202 each, no POST before acknowledgement, no overflow or page errors, run detail "1 of 1 committed". Scratch commits `695fa4e` (tree `86952012`) and `4a230148` (tree `63845ff1`) each match `snapshot_captured` and the `commit_intent` tree with the gate passed. Only `notes/objective.txt` changed. The scratch repo is clean and all QA listeners are down.
 - Live stays login-only, a release without this feature, and healthy.
+- Checkout exclusion, parent-verified separately: `cargo fmt --check`, 54 serial tests and 17 web tests. No production change.
 
-**Still open.** Cross-process exclusion or an exclusive checkout, a pinned isolated launcher and relay, per-run watchdog provisioning, policy approval and rollout, a real device, and hosted CI.
+**Still open.** An exclusive checkout (the advisory lock does not cover orphaned workers, arbitrary Git writers or NFS), a pinned isolated launcher and relay, per-run watchdog provisioning, policy approval and rollout, a real device, and hosted CI.

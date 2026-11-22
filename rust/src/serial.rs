@@ -199,6 +199,8 @@ pub enum Finish {
     Stopped,
     Paused,
     OwnedElsewhere,
+    /// Another lmloop process holds this Git checkout; nothing was changed.
+    CheckoutBusy,
     NeedsReconciliation(String),
     NoRun,
     Usage(String),
@@ -1179,7 +1181,21 @@ pub fn start_pilot(store: &Store, run_id: &str, policy: Policy) -> Result<Finish
     begin(store, run_id, policy, true)
 }
 
+/// The checkout guard for `repo`, or `Err(())` when another process holds it. A lookup failure
+/// is an error, never a skipped guard. Only a path git says is not a repository has nothing to
+/// guard (a task then fails at `Repo::open`; a committing resume cannot see its commit land).
+fn checkout(repo: &Path) -> Result<std::result::Result<Option<lease::Lease>, ()>> {
+    let Some(git_dir) = git::checkout_dir(repo)? else {
+        return Ok(Ok(None));
+    };
+    Ok(lease::claim_checkout(&git_dir)?.map(Some).ok_or(()))
+}
+
 fn begin(store: &Store, run_id: &str, policy: Policy, pilot: bool) -> Result<Finish> {
+    // First, so a busy checkout leaves no run directory behind. Held until `drive` returns.
+    let Ok(_checkout) = checkout(&policy.repo)? else {
+        return Ok(Finish::CheckoutBusy);
+    };
     let dir = store.run_dir(run_id, true)?.expect("created");
     let Ok(_lease) = claim(&dir, if pilot { "pilot-run" } else { "fixture-run" })? else {
         return Ok(Finish::OwnedElsewhere);
@@ -1243,6 +1259,25 @@ pub fn resume(store: &Store, run_id: &str) -> Result<Finish> {
             "run {run_id}: a pilot run is one-shot and cannot be resumed (its worktree is preserved); nothing was changed"
         )));
     }
+    // Only a resume that may go on to write takes the checkout; complete/failed/stopped/lost
+    // runs stay read-only refusals even while another process holds it.
+    let _checkout = if matches!(
+        st.phase,
+        RunPhase::Paused | RunPhase::Idle | RunPhase::Committing
+    ) {
+        match checkout(&st.policy.repo)? {
+            Ok(Some(g)) => Some(g),
+            Ok(None) => {
+                // A resume that may commit never goes on unguarded.
+                return Ok(Finish::NeedsReconciliation(format!(
+                    "run {run_id}: the run's repo is not a Git repository, so its checkout cannot be guarded; the journal, run.json and Git were not changed"
+                )));
+            }
+            Err(()) => return Ok(Finish::CheckoutBusy),
+        }
+    } else {
+        None
+    };
     let refuse = |why: &str| {
         Ok(Finish::NeedsReconciliation(format!(
             "run {run_id}: {why}; nothing was changed"
