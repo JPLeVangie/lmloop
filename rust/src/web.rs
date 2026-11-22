@@ -1,8 +1,9 @@
 //! Local web adapter over `operator::Operator` (M3): the same read, control and
 //! decision operations the TUI uses, as JSON over loopback HTTP. It owns no run
-//! logic, launches no worker (only the existing fixture `resume`), and takes no
-//! argv, path or import from a client. FIXTURE EVIDENCE ONLY: production auth,
-//! PWA, Android and the pilot are separate work.
+//! logic, launches no worker except the existing fixture `resume` and, only with
+//! `--launch-registry`, a one-task pilot from an operator-owned template (`project.rs`:
+//! a client picks a project id and objective text, never argv, path, scope or timeout).
+//! FIXTURE EVIDENCE ONLY: production auth, PWA and Android are separate work.
 //!
 //! Boundary (every request, in `guard`):
 //! * Binds `127.0.0.1` only; there is no host option. `Host` must equal the bound
@@ -42,6 +43,7 @@
 
 use crate::lease::LeaseState;
 use crate::operator::{Control, Decision, Operator, RunKind, RunSummary};
+use crate::project::Registry;
 use crate::state::{Error, Result as StateResult};
 use axum::Router;
 use axum::body::Bytes;
@@ -81,6 +83,7 @@ struct Ctx {
     public_origin: Option<String>,
     auth: Option<(String, String)>,
     inflight: AtomicUsize,
+    launch: Option<Registry>,
 }
 
 struct Slot<'a>(&'a AtomicUsize);
@@ -109,8 +112,16 @@ pub fn run(
     port: u16,
     auth_file: Option<&FsPath>,
     public_origin: Option<&str>,
+    launch_registry: Option<&FsPath>,
 ) -> StateResult<()> {
     let auth = auth_file.map(read_auth).transpose()?;
+    let launch = launch_registry.map(Registry::load).transpose()?;
+    if launch.is_some() && auth.is_none() {
+        return Err(Error::new(
+            "usage",
+            "--launch-registry requires --auth-file",
+        ));
+    }
     if public_origin.is_some() && auth.is_none() {
         return Err(Error::new("usage", "--public-origin requires --auth-file"));
     }
@@ -139,6 +150,7 @@ pub fn run(
             public_origin: public_origin.map(str::to_owned),
             auth,
             inflight: AtomicUsize::new(0),
+            launch,
         });
         axum::serve(listener, router(ctx)).await.map_err(io)
     })
@@ -260,7 +272,8 @@ fn router(ctx: Arc<Ctx>) -> Router {
             "/api/config",
             get(|| async { axum::Json(json!({ "poll_seconds": 5.0, "read_only": false })) }),
         )
-        .route("/api/runs", get(list))
+        .route("/api/runs", get(list).post(launch))
+        .route("/api/launch-options", get(launch_options))
         .route("/api/runs/{project}/{id}", get(android_view))
         .route("/api/runs/{id}", get(view))
         .route("/api/runs/{id}/logs/{name}", get(log))
@@ -402,7 +415,8 @@ fn fail(e: Error) -> Response {
     let status = match e.kind {
         "usage" | "note_required" => StatusCode::BAD_REQUEST,
         "no_run" | "no_log" => StatusCode::NOT_FOUND,
-        "unavailable" => StatusCode::CONFLICT,
+        "unavailable" | "ineligible" | "stale_revision" => StatusCode::CONFLICT,
+        "no_project" => StatusCode::NOT_FOUND,
         _ => {
             let line: String = e
                 .to_string()
@@ -612,6 +626,149 @@ async fn resume(State(c): State<Arc<Ctx>>, Path(id): Path<String>, body: Bytes) 
         Operator::new(&c.root).resume(&id)
     })
     .await
+}
+
+/// Review data for "New run": project, allowed scopes and budget only (no argv, paths, prompt).
+async fn launch_options(State(c): State<Arc<Ctx>>) -> Response {
+    blocking(move || {
+        Ok(match &c.launch {
+            Some(r) => r.options(&c.root),
+            None => json!({ "enabled": false, "projects": [] }),
+        })
+    })
+    .await
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LaunchBody {
+    project: String,
+    objective: String,
+    revision: String,
+}
+
+/// How long a launch may take to create its run before the client is told the outcome is unknown
+/// (the launch may still create it later).
+const LAUNCH_VISIBLE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Start one registry-template pilot through `serial::start_pilot`. Shares `RESUMING`, so at
+/// most one launch or resume runs per process. Answers 202 `{id}` once the run exists at
+/// `/api/runs/<id>`; the pilot then runs detached from the request, and only STOP-NOW
+/// (`/api/runs/<id>/control`) controls it.
+async fn launch(State(c): State<Arc<Ctx>>, body: Bytes) -> Response {
+    if c.launch.is_none() {
+        return problem(
+            StatusCode::NOT_FOUND,
+            "launch_disabled",
+            "this server has no launch registry",
+        );
+    }
+    let b: LaunchBody = match parse(&body) {
+        Ok(b) => b,
+        Err(r) => return r,
+    };
+    if RESUMING
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return problem(
+            StatusCode::CONFLICT,
+            "busy",
+            "a launch or resume is already running in this server",
+        );
+    }
+    let flag = ResumeFlag; // dropped with the closure if the launch is refused before it starts
+    let id = new_run_id();
+    let (c2, id2) = (c.clone(), id.clone());
+    // One deadline covers registry/Git preparation and the wait for run.json. On timeout the
+    // blocking task is not cancelled: it may still start the pilot (the slot stays held until
+    // that thread ends), so the 504 below is "unknown, possibly a run later", never "refused".
+    let t0 = std::time::Instant::now();
+    let started = tokio::time::timeout(
+        LAUNCH_VISIBLE,
+        tokio::task::spawn_blocking(move || {
+            let registry = c2.launch.as_ref().expect("checked");
+            let policy = registry.prepare(&c2.root, &b.project, &b.objective, &b.revision)?;
+            Ok(std::thread::spawn(move || {
+                let _flag = flag;
+                Operator::new(&c2.root).launch_pilot(&id2, policy)
+            }))
+        }),
+    )
+    .await;
+    let thread = match started {
+        Ok(Ok(Ok(t))) => t,
+        Ok(Ok(Err(e))) => return fail(e),
+        Ok(Err(_)) => {
+            return problem(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                "handler failed",
+            );
+        }
+        Err(_) => return launch_pending(),
+    };
+    let run_json = || {
+        crate::state::Store::new(&c.root)
+            .run_dir(&id, false)
+            .ok()
+            .flatten()
+            .is_some_and(|d| d.join("run.json").exists())
+    };
+    while t0.elapsed() < LAUNCH_VISIBLE {
+        // Read `finished` before the check: once the thread is done, run.json is final, so a run
+        // published just before an early error or reconciliation is still accepted.
+        let finished = thread.is_finished();
+        if run_json() {
+            return accepted(&id);
+        }
+        if finished {
+            // Ended without ever publishing run.json: a true pre-publication refusal.
+            return match thread.join() {
+                Ok(Ok(o)) => problem(
+                    StatusCode::CONFLICT,
+                    o.outcome,
+                    "the launch was refused before a run was created",
+                ),
+                Ok(Err(e)) => fail(e),
+                Err(_) => problem(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal",
+                    "launch failed",
+                ),
+            };
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    launch_pending()
+}
+
+fn launch_pending() -> Response {
+    problem(
+        StatusCode::GATEWAY_TIMEOUT,
+        "launch_pending",
+        "the launch has not created its run yet; check the run list before retrying",
+    )
+}
+
+fn accepted(id: &str) -> Response {
+    (StatusCode::ACCEPTED, axum::Json(json!({ "id": id }))).into_response()
+}
+
+/// `web-<unix millis>-<pid>-<n>`: simple, sortable, never client-chosen, unique per process by
+/// the counter. `launch` accepts on any published run.json for the id, so it relies on that
+/// uniqueness rather than on the engine's duplicate refusal (which is a 409 only if nothing
+/// was published, never reached for a fresh id).
+fn new_run_id() -> String {
+    static SEQ: AtomicUsize = AtomicUsize::new(0);
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis());
+    format!(
+        "web-{ms}-{}-{}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    )
 }
 
 #[cfg(test)]

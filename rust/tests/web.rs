@@ -81,11 +81,16 @@ impl Scratch {
         self.serve_args(&[])
     }
 
-    fn serve_auth(&self) -> Server {
+    fn auth_file(&self) -> PathBuf {
         let file = self.0.join("auth");
         use std::os::unix::fs::PermissionsExt;
         fs::write(&file, "test-user:correct-horse-battery\n").unwrap();
         fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
+        file
+    }
+
+    fn serve_auth(&self) -> Server {
+        let file = self.auth_file();
         self.serve_args(&[
             "--auth-file",
             file.to_str().unwrap(),
@@ -189,8 +194,17 @@ fn raw(addr: &str, method: &str, path: &str, headers: &[(&str, &str)], body: &[u
     }
 }
 
+/// The credentials `Scratch::auth_file` writes; a server started without `--auth-file` ignores them.
+const BASIC: &str = "Basic dGVzdC11c2VyOmNvcnJlY3QtaG9yc2UtYmF0dGVyeQ==";
+
 fn get(addr: &str, path: &str) -> Reply {
-    raw(addr, "GET", path, &[("Host", addr)], b"")
+    raw(
+        addr,
+        "GET",
+        path,
+        &[("Host", addr), ("Authorization", BASIC)],
+        b"",
+    )
 }
 
 fn post(addr: &str, path: &str, body: Value) -> Reply {
@@ -202,6 +216,7 @@ fn post(addr: &str, path: &str, body: Value) -> Reply {
         &[
             ("Host", addr),
             ("Origin", &origin),
+            ("Authorization", BASIC),
             ("Content-Type", "application/json"),
         ],
         body.to_string().as_bytes(),
@@ -532,7 +547,9 @@ fn denies_foreign_hosts_origins_types_and_oversize_bodies() {
         assert_eq!(raw(a, "GET", p, &[("Host", a)], b"").status, 405, "{p}");
     }
     assert_eq!(post(a, "/api/import", json!({})).status, 404);
-    assert_eq!(post(a, "/api/runs", json!({"argv": ["sh"]})).status, 405);
+    // Without --launch-registry a POST to /api/runs launches nothing, whatever it carries.
+    let r = post(a, "/api/runs", json!({"argv": ["sh"]}));
+    assert_eq!((r.status, r.kind().as_str()), (404, "launch_disabled"));
     let long = "n".repeat(3000);
     let r = post(
         a,
@@ -863,4 +880,469 @@ fn android_read_contract_additive_and_guarded() {
         b"{}",
     );
     assert_eq!(resume.status, 403);
+}
+
+// ---- "New run": opt-in launch registry over operator-owned one-task pilot templates ----
+
+impl Scratch {
+    /// A private one-task template (fake worker/gate, scope `src/one.txt`) and a private registry
+    /// naming it as project `demo`; returns (registry, template) paths. `mode` is the task prompt.
+    fn registry(&self, mode: &str) -> (PathBuf, PathBuf) {
+        let fx = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let bin = self.0.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        // The launcher name the fixture runner refuses; a pilot template may use it.
+        fs::copy(fx.join("fake-opencode"), bin.join("opencode")).unwrap();
+        let template = self.0.join("template.json");
+        self.private(
+            &template,
+            &json!({
+                "manifest_version": 1,
+                "repo": self.0.join("repo"),
+                "worker": { "argv": [bin.join("opencode")], "timeout_secs": 30 },
+                "gate": { "argv": [fx.join("gate-no-fail")], "timeout_secs": 30 },
+                "tasks": [{ "id": "t1", "prompt": mode, "scopes": ["src/one.txt"] }],
+            }),
+        );
+        let registry = self.0.join("registry.json");
+        self.private(
+            &registry,
+            &json!({
+                "registry_version": 1,
+                "projects": [{ "id": "demo", "label": "Demo project", "manifest": template }],
+            }),
+        );
+        (registry, template)
+    }
+
+    fn private(&self, path: &Path, v: &Value) {
+        self.private_bytes(path, v.to_string().as_bytes());
+    }
+
+    fn private_bytes(&self, path: &Path, body: &[u8]) {
+        use std::os::unix::fs::PermissionsExt;
+        fs::write(path, body).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    /// Launching needs authentication, even on loopback.
+    fn serve_launch(&self, registry: &Path) -> Server {
+        let auth = self.auth_file();
+        self.serve_args(&[
+            "--auth-file",
+            auth.to_str().unwrap(),
+            "--launch-registry",
+            registry.to_str().unwrap(),
+        ])
+    }
+
+    /// Rewrite the template through `f` (private, as the registry requires).
+    fn edit_template(&self, template: &Path, f: impl FnOnce(&mut Value)) {
+        let mut v: Value = serde_json::from_slice(&fs::read(template).unwrap()).unwrap();
+        f(&mut v);
+        self.private(template, &v);
+    }
+}
+
+fn demo(a: &str) -> Value {
+    get(a, "/api/launch-options").json()["projects"][0].clone()
+}
+
+fn wait_phase(a: &str, id: &str, phase: &str) -> Value {
+    let t = Instant::now();
+    loop {
+        let v = get(a, &format!("/api/runs/{id}")).json();
+        if v["phase"] == phase {
+            return v;
+        }
+        assert!(
+            t.elapsed() < Duration::from_secs(30),
+            "{id} never reached {phase}: {v}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+#[test]
+fn launch_is_off_unless_a_registry_is_given() {
+    let s = Scratch::new("launch-off");
+    let srv = s.serve();
+    let a = srv.addr.as_str();
+    assert_eq!(get(a, "/api/launch-options").json()["enabled"], false);
+    let r = post(
+        a,
+        "/api/runs",
+        json!({"project": "demo", "objective": "x", "revision": "y"}),
+    );
+    assert_eq!((r.status, r.kind().as_str()), (404, "launch_disabled"));
+    assert!(!s.state().join("v1/runs").exists());
+}
+
+#[test]
+fn registry_must_be_private_and_needs_an_explicit_state_root() {
+    let s = Scratch::new("launch-reg");
+    let (registry, _) = s.registry("ok|src/one.txt|x");
+    let run = |explicit: bool| {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_lmloop"));
+        c.env_remove("LMLOOP_RUST_STATE_ROOT");
+        if explicit {
+            c.arg("--state-root").arg(s.state());
+        } else {
+            c.env("LMLOOP_RUST_STATE_ROOT", s.state());
+        }
+        c.args(["web", "--port", "0", "--launch-registry"])
+            .arg(&registry)
+            .output()
+            .unwrap()
+    };
+    assert_eq!(run(false).status.code(), Some(2));
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&registry, fs::Permissions::from_mode(0o644)).unwrap();
+    let out = run(true);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("launch registry"));
+
+    // A valid registry without --auth-file is refused before anything listens.
+    fs::set_permissions(&registry, fs::Permissions::from_mode(0o600)).unwrap();
+    let out = run(true);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(out.stdout.is_empty(), "{out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("--launch-registry requires --auth-file")
+    );
+}
+
+#[test]
+fn launch_templates_with_unsafe_scope_stale_watchdog_or_no_prompt_room_are_not_eligible() {
+    let s = Scratch::new("launch-preflight");
+    let (registry, template) = s.registry("ok|src/one.txt|x");
+    let srv = s.serve_launch(&registry);
+    let a = srv.addr.as_str();
+    let rev = demo(a)["revision"].as_str().unwrap().to_string();
+
+    // A literal scope that git would refuse is unusable, not launchable.
+    s.edit_template(&template, |v| v["tasks"][0]["scopes"] = json!(["../x"]));
+    let p = demo(a);
+    assert_eq!(p["eligible"], false);
+    assert_eq!(p["reason"], "the project template is not usable");
+    assert!(p.get("scopes").is_none());
+
+    // The worker watchdog's progress file must be a fresh, empty, usable file: absent, a partial
+    // `model` prefix (baseline 0, but not empty) and a whole record are all refused on GET and POST.
+    let progress = s.0.join("progress");
+    s.edit_template(&template, |v| {
+        v["tasks"][0]["scopes"] = json!(["src/one.txt"]);
+        v["worker"]["watchdog"] =
+            json!({"progress_file": progress, "startup_secs": 30, "idle_secs": 30});
+    });
+    let stale = "the worker progress file is not fresh or usable";
+    let launch = |rev: &str| {
+        post(
+            a,
+            "/api/runs",
+            json!({"project": "demo", "objective": "x", "revision": rev}),
+        )
+    };
+    for content in [None, Some(&b"mod"[..]), Some(&b"model\n"[..])] {
+        match content {
+            Some(c) => s.private_bytes(&progress, c),
+            None => {
+                let _ = fs::remove_file(&progress);
+            }
+        }
+        let p = demo(a);
+        assert_eq!(
+            (p["eligible"].as_bool(), p["reason"].as_str()),
+            (Some(false), Some(stale))
+        );
+        let r = launch(p["revision"].as_str().unwrap());
+        assert_eq!(
+            (r.status, r.kind().as_str()),
+            (409, "ineligible"),
+            "{content:?}"
+        );
+        assert!(!r.body.contains("lmloop-web-"), "path leaked: {}", r.body);
+    }
+    s.private_bytes(&progress, b"");
+    assert_eq!(demo(a)["eligible"], true);
+
+    // No room left for even a minimal objective: not advertised as launchable.
+    s.edit_template(&template, |v| {
+        v["tasks"][0]["prompt"] = json!("x".repeat(16 * 1024));
+    });
+    let p = demo(a);
+    assert_eq!(p["eligible"], false);
+    assert_eq!(p["reason"], "the project template is not usable");
+    assert_ne!(p["revision"], rev.as_str());
+}
+
+#[test]
+fn options_show_project_scopes_and_budget_but_no_argv_paths_or_prompt() {
+    let s = Scratch::new("launch-options");
+    let (registry, template) = s.registry("ok|src/one.txt|secret-prompt");
+    let srv = s.serve_launch(&registry);
+    let a = srv.addr.as_str();
+    let r = get(a, "/api/launch-options");
+    assert_eq!(r.status, 200);
+    for leak in [
+        "opencode",
+        "gate-no-fail",
+        "secret-prompt",
+        "argv",
+        "template.json",
+        "lmloop-web-",
+    ] {
+        assert!(!r.body.contains(leak), "{leak} leaked: {}", r.body);
+    }
+    let p = demo(a);
+    assert_eq!(
+        (p["id"].as_str(), p["eligible"].as_bool()),
+        (Some("demo"), Some(true))
+    );
+    assert_eq!(p["label"], "Demo project");
+    assert_eq!(p["scopes"], json!(["src/one.txt"]));
+    assert_eq!(p["budget"]["tasks"], 1);
+    assert_eq!(p["budget"]["worker_timeout_secs"], 30);
+    assert_eq!(p["budget"]["gate_timeout_secs"], 30);
+    let rev = p["revision"].as_str().unwrap().to_string();
+    assert_eq!(demo(a)["revision"], rev.as_str(), "revision is stable");
+
+    // A changed template is a changed revision; a dirty checkout is shown ineligible.
+    let mut v: Value = serde_json::from_slice(&fs::read(&template).unwrap()).unwrap();
+    v["gate"]["timeout_secs"] = json!(31);
+    s.private(&template, &v);
+    let p = demo(a);
+    assert_ne!(p["revision"], rev.as_str());
+    assert_eq!(p["budget"]["gate_timeout_secs"], 31);
+    fs::write(s.0.join("repo/README"), "dirty\n").unwrap();
+    let p = demo(a);
+    assert_eq!(p["eligible"], false);
+    assert!(p["reason"].as_str().unwrap().contains("uncommitted"));
+
+    // Two tasks make the project unusable, not launchable.
+    v["tasks"] = json!([
+        { "id": "t1", "prompt": "ok|src/one.txt|x", "scopes": ["src/one.txt"] },
+        { "id": "t2", "prompt": "ok|src/two.txt|x", "scopes": ["src/two.txt"] },
+    ]);
+    s.private(&template, &v);
+    assert_eq!(demo(a)["eligible"], false);
+    assert!(demo(a).get("scopes").is_none());
+}
+
+#[test]
+fn launch_checks_input_revision_and_eligibility_before_starting_anything() {
+    let s = Scratch::new("launch-refuse");
+    let (registry, _) = s.registry("ok|src/one.txt|x");
+    let srv = s.serve_launch(&registry);
+    let a = srv.addr.as_str();
+    let rev = demo(a)["revision"].as_str().unwrap().to_string();
+    let body = |project: &str, objective: &str, revision: &str| {
+        post(
+            a,
+            "/api/runs",
+            json!({"project": project, "objective": objective, "revision": revision}),
+        )
+    };
+    let kind = |r: Reply| (r.status, r.kind());
+    assert_eq!(
+        kind(body("demo", "do it", "stale")),
+        (409, "stale_revision".into())
+    );
+    assert_eq!(
+        kind(body("nope", "do it", &rev)),
+        (404, "no_project".into())
+    );
+    assert_eq!(kind(body("demo", "  ", &rev)), (400, "usage".into()));
+    assert_eq!(
+        kind(body("demo", &"x".repeat(4 * 1024 + 1), &rev)),
+        (400, "usage".into())
+    );
+    assert_eq!(
+        kind(body("demo", "bad\u{1b}[31m", &rev)),
+        (400, "usage".into())
+    );
+    for extra in [
+        json!({"argv": ["sh"]}),
+        json!({"scope_set": "x"}),
+        json!({"run_id": "mine"}),
+    ] {
+        let mut b = json!({"project": "demo", "objective": "x", "revision": rev});
+        b.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        assert_eq!(post(a, "/api/runs", b).status, 400);
+    }
+    fs::write(s.0.join("repo/README"), "dirty\n").unwrap();
+    assert_eq!(
+        kind(body("demo", "do it", &rev)),
+        (409, "ineligible".into())
+    );
+    assert!(
+        !s.state().join("v1/runs").exists(),
+        "a refused launch created a run"
+    );
+    // The refusals released the one-at-a-time slot.
+    fs::write(s.0.join("repo/README"), "base\n").unwrap();
+    assert_eq!(body("demo", "do it", &rev).status, 202);
+}
+
+#[test]
+fn launch_starts_one_pilot_through_the_engine_and_names_the_created_run() {
+    let s = Scratch::new("launch-ok");
+    let (registry, _) = s.registry("ok|src/one.txt|from-template");
+    let srv = s.serve_launch(&registry);
+    let a = srv.addr.as_str();
+    let rev = demo(a)["revision"].as_str().unwrap().to_string();
+    let head = s.git(&["rev-parse", "HEAD"]);
+    let r = post(
+        a,
+        "/api/runs",
+        json!({"project": "demo", "objective": "add the file", "revision": rev}),
+    );
+    assert_eq!(r.status, 202, "{}", r.body);
+    assert_eq!(r.json().as_object().unwrap().len(), 1);
+    let id = r.json()["id"].as_str().unwrap().to_string();
+
+    // The id is the created run: a one-shot pilot, committed through the gate.
+    let v = wait_phase(a, &id, "complete");
+    assert_eq!(v["kind"], "serial_pilot");
+    assert_ne!(s.git(&["rev-parse", "HEAD"]), head);
+    assert_eq!(s.git(&["log", "-1", "--format=%s"]), "lmloop pilot: t1");
+    assert_eq!(
+        fs::read_to_string(s.0.join("repo/src/one.txt")).unwrap(),
+        "from-template\n"
+    );
+    let st: Value = serde_json::from_slice(
+        &fs::read(s.state().join(format!("v1/runs/{id}/run.json"))).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(st["pilot"], true);
+    let prompt = st["policy"]["tasks"][0]["prompt"].as_str().unwrap();
+    assert!(
+        prompt.starts_with("ok|src/one.txt|from-template") && prompt.ends_with("add the file"),
+        "{prompt}"
+    );
+    assert_eq!(st["policy"]["tasks"][0]["scopes"], json!(["src/one.txt"]));
+
+    // One-shot: no resume, and a second launch gets its own fresh id.
+    assert_eq!(
+        post(a, &format!("/api/runs/{id}/resume"), json!({})).status,
+        409
+    );
+    let t = Instant::now();
+    let r2 = loop {
+        let r = post(
+            a,
+            "/api/runs",
+            json!({"project": "demo", "objective": "again", "revision": rev}),
+        );
+        if r.kind() != "busy" {
+            break r;
+        }
+        assert!(t.elapsed() < Duration::from_secs(10), "slot never freed");
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert_eq!(r2.status, 202, "{}", r2.body);
+    assert_ne!(r2.json()["id"], id.as_str());
+}
+
+#[test]
+fn one_launch_at_a_time_and_stop_now_still_ends_it() {
+    let s = Scratch::new("launch-busy");
+    let (registry, _) = s.registry("slow|src/one.txt|x");
+    let srv = s.serve_launch(&registry);
+    let a = srv.addr.as_str();
+    let rev = demo(a)["revision"].as_str().unwrap().to_string();
+    let head = s.git(&["rev-parse", "HEAD"]);
+    let launch = || {
+        post(
+            a,
+            "/api/runs",
+            json!({"project": "demo", "objective": "x", "revision": rev}),
+        )
+    };
+    let r = launch();
+    assert_eq!(r.status, 202, "{}", r.body);
+    let id = r.json()["id"].as_str().unwrap().to_string();
+    let t = Instant::now();
+    while get(a, &format!("/api/runs/{id}")).json()["actions"]["stop_now"]["available"] != true {
+        assert!(
+            t.elapsed() < Duration::from_secs(20),
+            "worker never started"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let again = launch();
+    assert_eq!((again.status, again.kind().as_str()), (409, "busy"));
+    assert_eq!(
+        post(a, &format!("/api/runs/{id}/resume"), json!({})).status,
+        409
+    );
+    let view = get(a, &format!("/api/runs/{id}")).json();
+    assert_eq!(view["actions"]["stop"]["available"], false); // one-shot: only Stop now
+    // Wait for the slow fixture's write before stopping; STOP-NOW may arrive immediately after
+    // the worker starts, before its file write makes the checkout ineligible.
+    let t = Instant::now();
+    while !s.0.join("repo/src/one.txt").exists() {
+        assert!(
+            t.elapsed() < Duration::from_secs(10),
+            "worker never wrote its file"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let r = post(
+        a,
+        &format!("/api/runs/{id}/control"),
+        json!({"control": "stop_now"}),
+    );
+    assert_eq!(r.status, 200, "{}", r.body);
+    wait_phase(a, &id, "stopped");
+    assert_eq!(
+        s.git(&["rev-parse", "HEAD"]),
+        head,
+        "stop committed something"
+    );
+    // The slot frees when the pilot's own thread ends; the stopped worker left src/one.txt, so
+    // the next launch is then refused as ineligible (never "busy" again).
+    let t = Instant::now();
+    loop {
+        let r = launch();
+        if r.kind() != "busy" {
+            assert_eq!(
+                (r.status, r.kind().as_str()),
+                (409, "ineligible"),
+                "{}",
+                r.body
+            );
+            break;
+        }
+        assert!(t.elapsed() < Duration::from_secs(10), "slot never freed");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+#[test]
+fn a_fast_launch_that_published_its_run_is_always_accepted_with_that_id() {
+    // Runs finish within ms, so the handler often sees a finished engine thread: a published
+    // run.json (complete, then task_failed for the unchanged file) must still be a 202 + id.
+    let s = Scratch::new("launch-fast");
+    let (registry, _) = s.registry("ok|src/one.txt|same");
+    let srv = s.serve_launch(&registry);
+    let a = srv.addr.as_str();
+    for n in 0..6 {
+        let rev = demo(a)["revision"].as_str().unwrap().to_string();
+        let body = json!({"project": "demo", "objective": "x", "revision": rev});
+        let t = Instant::now();
+        let r = loop {
+            let r = post(a, "/api/runs", body.clone());
+            if r.kind() != "busy" {
+                break r;
+            }
+            assert!(t.elapsed() < Duration::from_secs(10), "slot never freed");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert_eq!(r.status, 202, "launch {n}: {}", r.body);
+        let id = r.json()["id"].as_str().unwrap().to_string();
+        assert_eq!(get(a, &format!("/api/runs/{id}")).status, 200, "launch {n}");
+    }
 }

@@ -26,6 +26,7 @@
       <h2 id="runs-h">Runs</h2>
       <span class="note" id="runs-count"></span>
     </div>
+    <button type="button" class="btn new-run" id="new-run" aria-haspopup="dialog">New run</button>
     <div id="runs-state" class="state" role="status"></div>
     <ul class="runs" id="runs" aria-label="Runs, newest first"></ul>
   </aside>
@@ -123,6 +124,34 @@
   <div class="dlg-btns">
     <button type="button" class="btn ghost" id="dlg-cancel">Cancel</button>
     <button type="button" class="btn" id="dlg-ok" aria-disabled="true">Confirm</button>
+  </div>
+</dialog>
+
+<dialog id="ldlg" aria-labelledby="ldlg-title" aria-describedby="ldlg-lede">
+  <h2 id="ldlg-title" tabindex="-1">New run</h2>
+  <p id="ldlg-lede" class="dlg-reason"></p>
+  <div id="ldlg-state" class="state" role="status"></div>
+  <div id="ldlg-form" hidden>
+    <fieldset id="ldlg-opts"><legend>Approved checkout policy</legend><div id="ldlg-optlist"></div></fieldset>
+    <div id="ldlg-objwrap">
+      <label for="ldlg-obj">Objective</label>
+      <textarea id="ldlg-obj" rows="5" autocomplete="off" required aria-describedby="ldlg-count"></textarea>
+      <p class="count" id="ldlg-count"></p>
+    </div>
+    <div id="ldlg-offwrap" hidden>
+      <h3 class="off-h" id="ldlg-off-h">Not available</h3>
+      <ul class="offs" id="ldlg-off" aria-labelledby="ldlg-off-h"></ul>
+    </div>
+  </div>
+  <div id="ldlg-review" hidden>
+    <dl class="facts" id="ldlg-facts"></dl>
+    <label class="ack"><input type="checkbox" id="ldlg-ack"><span>I have reviewed the allowed commit scope, the one task and the worker and gate limits. Starting the run uses them as shown.</span></label>
+  </div>
+  <p class="flash bad" id="ldlg-err" role="alert" hidden></p>
+  <div class="dlg-btns">
+    <button type="button" class="btn ghost" id="ldlg-cancel">Cancel</button>
+    <button type="button" class="btn ghost" id="ldlg-back" hidden>Back</button>
+    <button type="button" class="btn" id="ldlg-primary" aria-disabled="true" hidden>Review</button>
   </div>
 </dialog>
 

@@ -197,6 +197,12 @@ impl Progress {
         self.base
     }
 
+    /// True only for a zero-byte file at `open`: a partial `model` prefix has baseline 0 but is
+    /// not empty, and could not be told from a live writer's.
+    pub fn was_empty_at_open(&self) -> bool {
+        self.seen_len == 0
+    }
+
     fn bad(&self, m: &str) -> Error {
         Error::new("progress_invalid", format!("{}: {m}", self.path.display()))
     }
