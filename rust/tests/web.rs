@@ -1229,11 +1229,19 @@ fn launch_starts_one_pilot_through_the_engine_and_names_the_created_run() {
         post(a, &format!("/api/runs/{id}/resume"), json!({})).status,
         409
     );
-    let r2 = post(
-        a,
-        "/api/runs",
-        json!({"project": "demo", "objective": "again", "revision": rev}),
-    );
+    let t = Instant::now();
+    let r2 = loop {
+        let r = post(
+            a,
+            "/api/runs",
+            json!({"project": "demo", "objective": "again", "revision": rev}),
+        );
+        if r.kind() != "busy" {
+            break r;
+        }
+        assert!(t.elapsed() < Duration::from_secs(10), "slot never freed");
+        std::thread::sleep(Duration::from_millis(100));
+    };
     assert_eq!(r2.status, 202, "{}", r2.body);
     assert_ne!(r2.json()["id"], id.as_str());
 }
@@ -1272,6 +1280,16 @@ fn one_launch_at_a_time_and_stop_now_still_ends_it() {
     );
     let view = get(a, &format!("/api/runs/{id}")).json();
     assert_eq!(view["actions"]["stop"]["available"], false); // one-shot: only Stop now
+    // Wait for the slow fixture's write before stopping; STOP-NOW may arrive immediately after
+    // the worker starts, before its file write makes the checkout ineligible.
+    let t = Instant::now();
+    while !s.0.join("repo/src/one.txt").exists() {
+        assert!(
+            t.elapsed() < Duration::from_secs(10),
+            "worker never wrote its file"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
     let r = post(
         a,
         &format!("/api/runs/{id}/control"),
