@@ -415,7 +415,7 @@ fn fail(e: Error) -> Response {
     let status = match e.kind {
         "usage" | "note_required" => StatusCode::BAD_REQUEST,
         "no_run" | "no_log" => StatusCode::NOT_FOUND,
-        "unavailable" | "ineligible" | "stale_revision" => StatusCode::CONFLICT,
+        "unavailable" | "ineligible" | "stale_revision" | "busy" => StatusCode::CONFLICT,
         "no_project" => StatusCode::NOT_FOUND,
         _ => {
             let line: String = e
@@ -623,7 +623,11 @@ async fn resume(State(c): State<Arc<Ctx>>, Path(id): Path<String>, body: Bytes) 
     let flag = ResumeFlag;
     blocking(move || {
         let _flag = flag;
-        Operator::new(&c.root).resume(&id)
+        let o = Operator::new(&c.root).resume(&id)?;
+        if o.outcome == "checkout_busy" {
+            return Err(Error::new("busy", o.message));
+        }
+        Ok(o)
     })
     .await
 }
@@ -725,6 +729,11 @@ async fn launch(State(c): State<Arc<Ctx>>, body: Bytes) -> Response {
         if finished {
             // Ended without ever publishing run.json: a true pre-publication refusal.
             return match thread.join() {
+                Ok(Ok(o)) if o.outcome == "checkout_busy" => problem(
+                    StatusCode::CONFLICT,
+                    "busy",
+                    "another run holds this checkout; nothing was started",
+                ),
                 Ok(Ok(o)) => problem(
                     StatusCode::CONFLICT,
                     o.outcome,

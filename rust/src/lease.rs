@@ -5,7 +5,7 @@ use crate::state::{Error, Result, check_file, io_err, now_unix, read_bounded};
 use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions, TryLockError};
 use std::io::{Read, Write};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::Path;
 
 const FILE: &str = "owner.lock";
@@ -57,19 +57,46 @@ pub enum Claim {
     Lost(LeaseInfo),
 }
 
-/// Try to become the owner of `run_dir`. A loser changes nothing.
-pub fn claim(run_dir: &Path, command: &str) -> Result<Claim> {
-    let path = run_dir.join(FILE);
-    let mut file = OpenOptions::new()
+/// Open (creating if absent, never truncating) a private lock file: no symlink, no FIFO wait.
+fn open_lock(path: &Path) -> Result<File> {
+    let file = OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(&path)
-        .map_err(io_err(&path))?;
-    check_file(&file, &path)?;
+        .open(path)
+        .map_err(io_err(path))?;
+    check_file(&file, path)?;
+    Ok(file)
+}
+
+/// One lmloop writer per Git checkout, whatever state root it uses. `git_dir` is the
+/// worktree-specific Git directory, so linked worktrees are independent. Nonblocking; a lock
+/// file is never unlinked or truncated, and one that is hard-linked elsewhere is refused.
+/// `None` means another process holds it. The OS drops it when the holder dies, so it cannot
+/// outlive the process (a worker orphaned by a killed owner is no longer excluded).
+pub fn claim_checkout(git_dir: &Path) -> Result<Option<Lease>> {
+    let path = git_dir.join("lmloop-checkout.lock");
+    let file = open_lock(&path)?;
+    if file.metadata().map_err(io_err(&path))?.nlink() != 1 {
+        return Err(Error::new(
+            "unsafe_path",
+            format!("{} has more than one hard link", path.display()),
+        ));
+    }
+    match file.try_lock() {
+        Ok(()) => Ok(Some(Lease { _file: file })),
+        Err(TryLockError::WouldBlock) => Ok(None),
+        Err(TryLockError::Error(e)) => Err(io_err(&path)(e)),
+    }
+}
+
+/// Try to become the owner of `run_dir`. A loser changes nothing.
+pub fn claim(run_dir: &Path, command: &str) -> Result<Claim> {
+    let path = run_dir.join(FILE);
+    let mut file = open_lock(&path)?;
     match file.try_lock() {
         Ok(()) => {}
         Err(TryLockError::WouldBlock) => {

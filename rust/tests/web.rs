@@ -1346,3 +1346,65 @@ fn a_fast_launch_that_published_its_run_is_always_accepted_with_that_id() {
         assert_eq!(get(a, &format!("/api/runs/{id}")).status, 200, "launch {n}");
     }
 }
+
+#[test]
+fn a_launch_on_a_checkout_held_by_another_process_is_busy_and_publishes_nothing() {
+    let s = Scratch::new("launch-checkout");
+    let (registry, _) = s.registry("ok|src/one.txt|x");
+    let srv = s.serve_launch(&registry);
+    let a = srv.addr.as_str();
+    let rev = demo(a)["revision"].as_str().unwrap().to_string();
+    let head = s.git(&["rev-parse", "HEAD"]);
+    let body = json!({"project": "demo", "objective": "x", "revision": rev});
+    let git_dir = lmloop::git::checkout_dir(&s.0.join("repo"))
+        .unwrap()
+        .unwrap();
+    let held = lmloop::lease::claim_checkout(&git_dir).unwrap().unwrap();
+
+    let r = post(a, "/api/runs", body.clone());
+    assert_eq!((r.status, r.kind().as_str()), (409, "busy"), "{}", r.body);
+    assert!(
+        !r.body.contains("/tmp") && !r.body.contains("lock"),
+        "{}",
+        r.body
+    );
+    assert!(
+        !s.state().join("v1/runs").exists(),
+        "a busy launch published"
+    );
+    assert_eq!(s.git(&["rev-parse", "HEAD"]), head);
+
+    drop(held);
+    let r = post(a, "/api/runs", body);
+    assert_eq!(r.status, 202, "{}", r.body);
+}
+
+#[test]
+fn a_resume_on_a_held_checkout_is_a_typed_409_busy_that_leaves_run_state_alone() {
+    let s = Scratch::new("resume-checkout");
+    s.start_paused("r1", "ok|docs/two.txt|x");
+    let srv = s.serve();
+    let a = srv.addr.as_str();
+    let run = s.state().join("v1/runs/r1");
+    let (head, run_json) = (
+        s.git(&["rev-parse", "HEAD"]),
+        fs::read(run.join("run.json")).unwrap(),
+    );
+    let events = fs::read(run.join("events.jsonl")).ok();
+    let git_dir = lmloop::git::checkout_dir(&s.0.join("repo"))
+        .unwrap()
+        .unwrap();
+    let held = lmloop::lease::claim_checkout(&git_dir).unwrap().unwrap();
+
+    let r = post(a, "/api/runs/r1/resume", json!({}));
+    assert_eq!((r.status, r.kind().as_str()), (409, "busy"), "{}", r.body);
+    // owner.lock metadata is rewritten by the claim, so the message must not deny it.
+    assert!(!r.body.contains("nothing was changed"), "{}", r.body);
+    assert_eq!(s.git(&["rev-parse", "HEAD"]), head);
+    assert_eq!(fs::read(run.join("run.json")).unwrap(), run_json);
+    assert_eq!(fs::read(run.join("events.jsonl")).ok(), events);
+
+    drop(held);
+    let r = post(a, "/api/runs/r1/resume", json!({}));
+    assert_eq!(r.status, 200, "{}", r.body);
+}

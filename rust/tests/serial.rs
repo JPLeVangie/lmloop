@@ -1959,3 +1959,160 @@ fn run_refuses_unsafe_manifest_use_and_creates_nothing() {
     assert_eq!(s.head(), base);
     assert_eq!(s.commits(), 1);
 }
+
+/// `fixture-run`/`fixture-resume` against the scratch repo with another state root.
+fn other_root(s: &Scratch, root: &str, args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_lmloop"))
+        .env_remove("LMLOOP_RUST_STATE_ROOT")
+        .arg("--state-root")
+        .arg(s.0.join(root))
+        .args(args)
+        .current_dir(&s.0)
+        .output()
+        .unwrap()
+}
+
+fn checkout_guard(s: &Scratch) -> Option<lmloop::lease::Lease> {
+    let git_dir = lmloop::git::checkout_dir(&s.repo()).unwrap().unwrap();
+    lmloop::lease::claim_checkout(&git_dir).unwrap()
+}
+
+#[test]
+fn a_held_checkout_refuses_a_fresh_run_from_another_root_and_frees_on_release() {
+    let s = Scratch::new("co-fresh");
+    let base = s.head();
+    let m = s.manifest(&[("t1", "ok|src/one.txt|first")], 30);
+    let held = checkout_guard(&s).expect("free checkout");
+    assert!(checkout_guard(&s).is_none(), "second claim must lose");
+
+    let args = ["fixture-run", "r1", "--manifest", m.to_str().unwrap()];
+    let out = other_root(&s, "state2", &args);
+    assert_eq!(code(&out), 7, "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("Git checkout"));
+    assert!(!s.0.join("state2/v1/runs/r1").exists(), "loser published");
+    assert!(!s.repo().join("src").exists());
+    assert_eq!(s.head(), base);
+
+    drop(held);
+    let out = other_root(&s, "state2", &args);
+    assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(s.commits(), 2);
+    assert!(checkout_guard(&s).is_some(), "the finished run released it");
+}
+
+#[test]
+fn a_held_checkout_stops_a_writing_resume_but_not_a_read_only_one() {
+    let s = Scratch::new("co-resume");
+    let first = ctl_prompt(&s, "ctl", "src/one.txt", "PAUSE");
+    let m = s.manifest(&[("t1", &first), ("t2", "ok|docs/two.txt|b")], 30);
+    assert_eq!(code(&s.run("r1", &m, None)), 12);
+    let (head, run_json) = (
+        s.head(),
+        fs::read(s.run_dir("r1").join("run.json")).unwrap(),
+    );
+    let log = fs::read(log_path(&s)).unwrap();
+
+    let held = checkout_guard(&s).unwrap();
+    assert_eq!(code(&s.lmloop(&["fixture-resume", "r1"], None)), 7);
+    assert_eq!(s.head(), head);
+    assert_eq!(
+        fs::read(s.run_dir("r1").join("run.json")).unwrap(),
+        run_json
+    );
+    assert_eq!(fs::read(log_path(&s)).unwrap(), log, "journal untouched");
+
+    drop(held);
+    assert_eq!(code(&s.lmloop(&["fixture-resume", "r1"], None)), 0);
+    assert_eq!(s.commits(), 3);
+
+    // Complete is a read-only answer: it needs no checkout.
+    let held = checkout_guard(&s).unwrap();
+    assert_eq!(code(&s.lmloop(&["fixture-resume", "r1"], None)), 0);
+    drop(held);
+}
+
+#[test]
+fn checkout_guard_is_per_worktree_and_refuses_unsafe_lock_files() {
+    let s = Scratch::new("co-unsafe");
+    let linked = s.0.join("linked");
+    s.git(&[
+        "worktree",
+        "add",
+        "-q",
+        "-b",
+        "other",
+        linked.to_str().unwrap(),
+    ]);
+    let main = checkout_guard(&s).unwrap();
+    let git_dir = lmloop::git::checkout_dir(&linked).unwrap().unwrap();
+    assert_ne!(
+        git_dir,
+        lmloop::git::checkout_dir(&s.repo()).unwrap().unwrap()
+    );
+    let other = lmloop::lease::claim_checkout(&git_dir).unwrap();
+    assert!(other.is_some(), "a linked worktree is independent");
+    drop((main, other));
+
+    // A pre-existing lock file is reused, never unlinked; links are refused.
+    let lock = lmloop::git::checkout_dir(&s.repo())
+        .unwrap()
+        .unwrap()
+        .join("lmloop-checkout.lock");
+    let ino = |p: &Path| std::os::unix::fs::MetadataExt::ino(&fs::metadata(p).unwrap());
+    let before = ino(&lock);
+    drop(checkout_guard(&s).unwrap());
+    assert_eq!(ino(&lock), before);
+    let alias = s.0.join("alias");
+    fs::hard_link(&lock, &alias).unwrap();
+    let git_dir = lmloop::git::checkout_dir(&s.repo()).unwrap().unwrap();
+    let err = lmloop::lease::claim_checkout(&git_dir).unwrap_err();
+    assert_eq!(err.kind, "unsafe_path");
+    fs::remove_file(&alias).unwrap();
+    fs::remove_file(&lock).unwrap();
+    std::os::unix::fs::symlink(s.0.join("elsewhere"), &lock).unwrap();
+    let err = lmloop::lease::claim_checkout(&git_dir).unwrap_err();
+    assert_eq!(err.kind, "unsafe_path");
+    assert!(
+        !s.0.join("elsewhere").exists(),
+        "symlink target was created"
+    );
+}
+
+#[test]
+fn checkout_lookup_failure_is_an_error_and_only_a_non_repo_is_unguarded() {
+    let s = Scratch::new("co-lookup");
+    let plain = s.0.join("plain");
+    fs::create_dir_all(&plain).unwrap();
+    assert!(lmloop::git::checkout_dir(&plain).unwrap().is_none());
+    let err = lmloop::git::checkout_dir(&s.0.join("missing")).unwrap_err();
+    assert_eq!(err.kind, "git");
+}
+
+#[test]
+fn a_committing_resume_whose_checkout_lookup_fails_changes_nothing() {
+    let s = Scratch::new("co-commit-lookup");
+    let m = s.manifest(
+        &[("t1", "ok|src/one.txt|a"), ("t2", "ok|docs/two.txt|b")],
+        30,
+    );
+    assert_eq!(code(&s.run("r1", &m, Some("after_cas"))), 86);
+    assert_eq!(s.status("r1")["run"]["phase"], "committing");
+    let (head, run_json) = (
+        s.head(),
+        fs::read(s.run_dir("r1").join("run.json")).unwrap(),
+    );
+    let log = fs::read(log_path(&s)).unwrap();
+
+    let gone = s.0.join("repo-gone");
+    fs::rename(s.repo(), &gone).unwrap();
+    let out = s.lmloop(&["fixture-resume", "r1"], None);
+    fs::rename(&gone, s.repo()).unwrap();
+    assert_ne!(code(&out), 0, "resumed without the checkout guard");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("git"));
+    assert_eq!(s.head(), head);
+    assert_eq!(
+        fs::read(s.run_dir("r1").join("run.json")).unwrap(),
+        run_json
+    );
+    assert_eq!(fs::read(log_path(&s)).unwrap(), log, "journal untouched");
+}
