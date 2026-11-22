@@ -25,6 +25,9 @@ const state = {
   flashes: new Map(), // run -> { kind, text, at }
   dlg: null, // { id, action, invoker }
   auth: undefined, // undefined until /api/config answers; then "oidc" (edge) or null (standalone)
+  // New run. Filled from /api/launch-options; sending is the duplicate-submit guard and
+  // locked blocks a retry whose first attempt may have created a run.
+  launch: { enabled: false, max: 0, opts: [], unavail: [], dropped: 0, status: "idle", error: null, readOnly: false, sel: null, step: "form", sending: false, locked: false, done: false, invoker: null, seq: 0 },
 };
 
 /* ───── small helpers ───── */
@@ -84,7 +87,8 @@ class ApiError extends Error {
 
 const SESSION_EXPIRED = "Your sign-in session has expired. Reload and sign in again.";
 
-async function api(path, opts) {
+// `expect` (opt-in): the one success status the caller accepts; any other 2xx is a bad_reply.
+async function api(path, { expect, ...opts } = {}) {
   let r;
   try {
     // "manual": an expired OIDC session answers with a cross-origin redirect to the IdP,
@@ -118,6 +122,7 @@ async function api(path, opts) {
     throw new ApiError(str(kind) || `http_${r.status}`, str(e && e.message) || str(e) || str(body && body.message) || plain || `HTTP ${r.status}`, r.status);
   }
   if (body === null) throw new ApiError("bad_reply", "The server sent a reply this page cannot read.");
+  if (expect && r.status !== expect) throw new ApiError("bad_reply", `The server answered ${r.status} where ${expect} was expected.`, r.status);
   return body;
 }
 // Standalone Basic config has no `auth`/`csrf`. The OIDC edge adds `auth: "oidc"`
@@ -126,7 +131,7 @@ async function api(path, opts) {
 const OIDC_NO_RESUME = "resume is not offered through the OIDC edge; use the standalone console";
 const edge = () => state.auth === "oidc";
 
-async function post(path, body, action) {
+async function post(path, body, action, expect) {
   const cfg = await api("/api/config");
   state.auth = cfg.auth || null;
   const headers = { "Content-Type": "application/json" };
@@ -136,7 +141,13 @@ async function post(path, body, action) {
     if (typeof cfg.csrf !== "string" || !cfg.csrf) throw new ApiError("csrf_missing", "The session has no CSRF token; reload and sign in again.");
   }
   if (typeof cfg.csrf === "string" && cfg.csrf) headers["X-CSRF-Token"] = cfg.csrf;
-  return api(path, { method: "POST", headers, body: JSON.stringify(body || {}) });
+  try {
+    return await api(path, { method: "POST", headers, body: JSON.stringify(body || {}), expect });
+  } catch (e) {
+    // Only errors raised after the POST left tell the caller the server may have acted.
+    if (e instanceof ApiError) e.sent = true;
+    throw e;
+  }
 }
 
 /* ───── status vocabulary ───── */
@@ -310,7 +321,7 @@ function schedule() {
 /* ───── runs list ───── */
 function applyList(runs) {
   state.runs = runs;
-  setState("runs-state", runs.length ? null : "empty", "No runs in this state root yet. Start one with the CLI; this page only observes and steers existing runs.");
+  setState("runs-state", runs.length ? null : "empty", "No runs in this state root yet. Use New run to start one from an approved policy, or use the CLI.");
   $("runs-count").textContent = runs.length ? `${runs.length} newest first${runs.length >= 100 ? " (list capped at 100)" : ""}` : "";
   if (!state.autoPicked && !state.selected && runs.length && matchMedia("(min-width: 960px)").matches) {
     state.autoPicked = true;
@@ -779,7 +790,336 @@ function closeDialog() {
   if ($("dlg").open) $("dlg").close();
 }
 
+/* ───── new run (operator-approved checkout policies) ─────
+   The server owns every authority: the page sends only the chosen policy's id, its
+   revision and the objective. It never accepts or sends a path, command, worker or budget.
+   GET /api/launch-options is {enabled, objective_max_bytes, projects[]}; the API names no
+   worker, so none is shown. */
+const RUN_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
+const LAUNCH_EMPTY = "No approved checkout policies are available. An operator approves them in the server's setup; this page cannot add one and accepts no path, command or time budget.";
+const LAUNCH_OFF = "New run is disabled: this server has no launch registry. Nothing can be started from this page.";
+const INCOMPLETE = "The server sent incomplete review data for this policy, so it cannot be started from here.";
+const UNNAMED = "The server sent an entry this page cannot identify safely.";
+
+function budgetLabel(s) {
+  if (s > 0 && s % 3600 === 0) return `${s / 3600} h`;
+  if (s > 0 && s % 60 === 0) return `${s / 60} min`;
+  return `${s} s`;
+}
+// null is "unset" (the manifest left it out); that is a fact to show, not a zero.
+const secsLabel = (s, why) => (s == null ? `unset${why ? ` (${why})` : ""}` : budgetLabel(s));
+const reasonText = (v) => (typeof v === "string" ? v.replace(/[\u0000-\u001f\u007f-\u009f]+/g, " ").trim().slice(0, 200) : "") || "No reason was given.";
+
+// The only place that knows the option schema (rust/src/project.rs `Registry::options`).
+// An eligible entry the operator cannot fully review becomes unavailable, never half-filled.
+function normalizeOptions(raw) {
+  const out = { enabled: false, max: 0, options: [], unavailable: [] };
+  if (!raw || raw.enabled !== true) return out;
+  out.enabled = true;
+  out.max = Number.isInteger(raw.objective_max_bytes) && raw.objective_max_bytes > 0 ? raw.objective_max_bytes : 0;
+  const str = (v) => (typeof v === "string" ? v.trim() : "");
+  const secs = (v) => (v == null ? null : Number.isInteger(v) && v > 0 ? v : NaN);
+  for (const p of Array.isArray(raw.projects) ? raw.projects : []) {
+    const id = str(p && p.id);
+    const label = str(p && p.label);
+    if (!RUN_ID.test(id) || !label) {
+      out.unavailable.push({ id: "", label: label || "Unnamed policy", reason: UNNAMED });
+      continue;
+    }
+    if (p.eligible !== true) {
+      out.unavailable.push({ id, label, reason: reasonText(p.reason) });
+      continue;
+    }
+    const b = p.budget && typeof p.budget === "object" ? p.budget : {};
+    // Scopes are literal Git paths: never trim, so what is reviewed is what the policy holds.
+    const scopes = Array.isArray(p.scopes) ? p.scopes : [];
+    const limits = { total: secs(b.worker_timeout_secs), startup: secs(b.worker_startup_secs), idle: secs(b.worker_idle_secs), gate: secs(b.gate_timeout_secs) };
+    const revision = typeof p.revision === "string" ? p.revision : "";
+    // Unset limits are shown as unset, not rejected: the server is the authority. Only a
+    // malformed value, or a worker with neither a total nor a watchdog, is not reviewable.
+    const ok =
+      revision &&
+      b.tasks === 1 &&
+      scopes.length > 0 &&
+      scopes.every((s) => typeof s === "string" && s.length > 0) &&
+      limits.gate !== null && // the engine always runs a hard gate limit, so a missing one is not reviewable
+      Object.values(limits).every((v) => !Number.isNaN(v)) &&
+      (limits.startup === null) === (limits.idle === null) &&
+      (limits.total !== null || limits.startup !== null);
+    if (!ok) out.unavailable.push({ id, label, reason: INCOMPLETE });
+    else out.options.push({ id, label, scopes, limits, revision });
+  }
+  return out;
+}
+
+const WIRE_MAX_BYTES = 8 * 1024; // web.rs MAX_BODY: the whole JSON request, escapes included
+
+/** "" when the server would accept this objective, else why not. Mirrors project.rs `prepare`
+ *  (trim, non-empty, UTF-8 byte cap, C0/C1 controls refused except \n and \t) plus web.rs's
+ *  8 KiB body cap, which JSON escaping (each \n is two bytes) can reach before the 4 KiB one. */
+function objectiveGap(text) {
+  const t = text.trim();
+  if (!t) return "an objective is required";
+  try {
+    encodeURIComponent(t); // throws on a lone surrogate, which serde_json would refuse
+  } catch (_) {
+    return "the objective is not valid Unicode text";
+  }
+  if (/[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/.test(t)) return "the objective contains control characters";
+  if (utf8(t) > state.launch.max) return "the objective is too large";
+  const o = selectedOption();
+  if (utf8(JSON.stringify({ project: o ? o.id : "", objective: t, revision: o ? o.revision : "" })) > WIRE_MAX_BYTES) return "the request would exceed the 8 KiB wire limit once JSON-escaped; shorten it or use fewer line breaks";
+  return "";
+}
+
+// A 409 that names one of these is a known refusal before any run was created.
+const REFUSED_409 = new Set(["busy", "stale_revision", "ineligible", "unavailable"]);
+// After these the server may already have created the run, so a blind retry could start two:
+// any 5xx (a gateway may answer for a server that went on), an unreadable reply, a lost
+// connection after the POST left, or a 409 whose kind is not a known refusal.
+const launchUncertain = (e) =>
+  e.status >= 500 || e.kind === "bad_reply" || (e.kind === "network" && e.sent === true) || (e.status === 409 && !REFUSED_409.has(e.kind));
+
+async function launchRun(opt, objective) {
+  const L = state.launch;
+  if (L.sending) throw new ApiError("busy", "A start request is already open.");
+  L.sending = true;
+  try {
+    const r = await post("/api/runs", { project: opt.id, objective, revision: opt.revision }, "launch", 202);
+    if (!r || typeof r.id !== "string" || !RUN_ID.test(r.id)) throw new ApiError("bad_reply", "The server did not return a usable run id.");
+    return r.id;
+  } finally {
+    L.sending = false;
+  }
+}
+
+const selectedOption = () => state.launch.opts.find((o) => o.id === state.launch.sel) || null;
+
+const scopeText = (scopes, sep) => scopes.map((s) => JSON.stringify(s)).join(sep);
+const workerLimits = (o) => `worker total ${secsLabel(o.limits.total)}, startup ${secsLabel(o.limits.startup)}, idle ${secsLabel(o.limits.idle)} · gate ${secsLabel(o.limits.gate)}`;
+
+function launchRows(o, objective) {
+  const l = o.limits;
+  return [
+    ["Policy", o.label],
+    ["Allowed commit scope", `${scopeText(o.scopes, "\n")}\nExact paths the task may commit, quoted so spaces show. This is not a filesystem sandbox.`],
+    ["Tasks", "1 task. Your objective is appended to the policy's fixed task prompt. The worker makes changes in the approved checkout in place; edits from a failed or stopped run are kept, not rolled back."],
+    ["Worker total limit", secsLabel(l.total, "no overall cap")],
+    ["Worker startup limit", secsLabel(l.startup, "no watchdog")],
+    ["Worker idle limit", secsLabel(l.idle, "no watchdog")],
+    ["Gate limit", secsLabel(l.gate)],
+    ["Policy revision", o.revision],
+    ["Objective", objective],
+  ];
+}
+
+function renderLaunch() {
+  const L = state.launch;
+  const nr = $("new-run");
+  nr.setAttribute("aria-disabled", String(L.sending));
+  nr.textContent = L.sending ? "Starting…" : "New run";
+  if (!$("ldlg").open) return;
+  const loaded = L.status === "ready" && !L.readOnly && L.enabled && L.max > 0;
+  const ready = loaded && L.opts.length > 0;
+  const review = ready && L.step === "review" && !!selectedOption();
+  $("ldlg-lede").textContent = review
+    ? "Check what the server will run. Nothing starts until you confirm."
+    : "Choose one of the checkout policies an operator has approved, then describe the objective.";
+  if (L.status === "loading") setState("ldlg-state", "loading", "Loading approved policies…");
+  else if (L.status === "error") {
+    const b = el("button", "btn ghost small", "Retry");
+    b.type = "button";
+    b.addEventListener("click", loadLaunchOptions);
+    $("ldlg-state").dataset.kind = "error";
+    $("ldlg-state").replaceChildren(document.createTextNode(`Could not load approved policies: ${L.error ? L.error.message : "unknown error"}`), document.createElement("br"), b);
+  } else if (L.readOnly) setState("ldlg-state", "empty", "This console is read-only; runs cannot be started from it.");
+  else if (!L.enabled) setState("ldlg-state", "empty", LAUNCH_OFF);
+  else if (L.max <= 0) setState("ldlg-state", "empty", "The server did not report an objective size limit, so this page cannot check one. Reload and try again.");
+  else if (!L.opts.length && !L.unavail.length) setState("ldlg-state", "empty", LAUNCH_EMPTY);
+  else if (!L.opts.length) setState("ldlg-state", "empty", "No policy can be started right now. Each one below says why.");
+  else setState("ldlg-state", null);
+
+  $("ldlg-form").hidden = !loaded || review;
+  $("ldlg-review").hidden = !review;
+  $("ldlg-opts").hidden = !ready;
+  $("ldlg-objwrap").hidden = !ready;
+  $("ldlg-offwrap").hidden = !loaded || review || !L.unavail.length;
+  if (loaded) {
+    rebuild($("ldlg-optlist"), JSON.stringify(L.opts), () =>
+      L.opts.map((o) => {
+        const lab = el("label", "opt");
+        const r = el("input");
+        r.type = "radio";
+        r.name = "ldlg-opt";
+        r.value = o.id;
+        r.dataset.fk = o.id;
+        r.checked = o.id === L.sel;
+        lab.append(r, document.createTextNode(o.label), el("span", "opt-meta", `commit scope ${scopeText(o.scopes, ", ")} · 1 task · ${workerLimits(o)}`));
+        return lab;
+      }),
+    );
+    rebuild($("ldlg-off"), JSON.stringify(L.unavail), () =>
+      L.unavail.map((u) => {
+        const li = el("li", "off");
+        li.append(el("span", "off-name", u.label), badge("not selectable", "warn"), el("span", "opt-meta", u.reason));
+        return li;
+      }),
+    );
+  }
+  const obj = $("ldlg-obj").value;
+  const gap = L.max > 0 ? objectiveGap(obj) : "";
+  const shown = !!obj.trim() && !!gap;
+  $("ldlg-count").textContent = `${utf8(obj.trim())} / ${L.max} bytes${shown ? ` · ${gap}` : ""}`;
+  $("ldlg-count").classList.toggle("over", shown);
+  $("ldlg-obj").setAttribute("aria-invalid", String(shown));
+  if (review) {
+    const o = selectedOption();
+    rebuild($("ldlg-facts"), JSON.stringify([o, obj.trim()]), () =>
+      launchRows(o, obj.trim()).map(([k, v]) => {
+        const row = el("div");
+        row.append(el("dt", null, k), el("dd", null, v));
+        return row;
+      }),
+    );
+  }
+  const p = $("ldlg-primary");
+  p.hidden = !ready;
+  p.textContent = review ? (L.sending ? "Starting…" : L.locked ? "Start locked" : "Start run") : "Review";
+  const blocked = review ? !$("ldlg-ack").checked || L.sending || L.locked : !selectedOption() || !!gap;
+  p.setAttribute("aria-disabled", String(blocked));
+  $("ldlg-back").hidden = !review || L.sending || L.locked;
+  $("ldlg-cancel").textContent = L.locked ? "Close and check Runs" : "Cancel";
+}
+
+async function loadLaunchOptions() {
+  const L = state.launch;
+  const seq = ++L.seq;
+  L.status = "loading";
+  renderLaunch();
+  try {
+    const [cfg, raw] = await Promise.all([api("/api/config"), api("/api/launch-options").catch((e) => (e.status === 404 ? null : Promise.reject(e)))]);
+    if (seq !== L.seq) return;
+    state.auth = cfg.auth || null;
+    L.readOnly = cfg.read_only === true;
+    const n = normalizeOptions(raw);
+    Object.assign(L, { enabled: n.enabled, max: n.max, opts: n.options, unavail: n.unavailable, status: "ready" });
+    if (L.sel && !L.opts.some((o) => o.id === L.sel)) {
+      L.sel = null;
+      L.step = "form";
+    }
+  } catch (e) {
+    if (seq !== L.seq) return;
+    L.status = "error";
+    L.error = e;
+  }
+  renderLaunch();
+  const a = document.activeElement;
+  if ($("ldlg").open && L.status === "ready" && (a === $("ldlg-title") || a === $("ldlg"))) {
+    (document.querySelector('#ldlg input[name="ldlg-opt"]:checked') || document.querySelector('#ldlg input[name="ldlg-opt"]') || $("ldlg-title")).focus();
+  }
+}
+
+function openLaunch(invoker) {
+  const L = state.launch;
+  if (L.sending || $("ldlg").open) return;
+  Object.assign(L, { invoker, step: "form", locked: false, done: false });
+  $("ldlg-ack").checked = false;
+  $("ldlg-err").hidden = true;
+  $("ldlg").showModal();
+  $("ldlg-title").focus();
+  loadLaunchOptions();
+}
+
+function closeLaunch() {
+  if ($("ldlg").open) $("ldlg").close();
+}
+
+async function submitLaunch() {
+  const L = state.launch;
+  const o = selectedOption();
+  const objective = $("ldlg-obj").value.trim();
+  if (!o || L.sending || L.locked || L.step !== "review" || !$("ldlg-ack").checked || objectiveGap(objective)) return;
+  $("ldlg-err").hidden = true;
+  const p = launchRun(o, objective); // sets L.sending synchronously
+  renderLaunch();
+  try {
+    const id = await p;
+    L.done = true;
+    $("ldlg-obj").value = "";
+    L.sel = null;
+    closeLaunch();
+    renderLaunch();
+    location.hash = `#/run/${enc(id)}`; // hashchange routes, refreshes and focuses the run
+    return;
+  } catch (e) {
+    // 504 launch_pending and every other outcome we cannot read leave the run's existence
+    // unknown: lock Start and send the operator to the Runs list. Nothing is resubmitted here.
+    const pending = e.status === 504;
+    const unsure = pending || launchUncertain(e);
+    if (unsure) L.locked = true;
+    let msg;
+    if (pending) {
+      msg = `The server has not confirmed the run yet (${e.kind === "launch_pending" ? "launch_pending" : `HTTP 504, ${e.kind}`}). It may still start. Check the Runs list before trying again; this page will not retry for you.`;
+    } else {
+      msg = `Start failed (${e.kind}): ${e.message}`;
+      if (unsure) msg += " The run may still have been created. Check the Runs list before trying again.";
+    }
+    if (unsure) msg += " Start stays locked until you close this dialog and open it again.";
+    else if (e.kind === "stale_revision" || e.kind === "ineligible") {
+      msg += " The approved policy list was reloaded. Review it again.";
+      L.step = "form";
+      $("ldlg-ack").checked = false;
+      loadLaunchOptions();
+    } else if (e.kind === "busy") msg += " Your objective is kept; try again once it finishes.";
+    else if (e.status === 413) msg += " Shorten the objective.";
+    $("ldlg-err").textContent = msg;
+    $("ldlg-err").hidden = false;
+    renderLaunch();
+    if (unsure) refresh();
+  }
+}
+
 /* ───── wiring ───── */
+$("new-run").addEventListener("click", (ev) => {
+  if (ev.currentTarget.getAttribute("aria-disabled") !== "true") openLaunch(ev.currentTarget);
+});
+$("ldlg-optlist").addEventListener("change", (ev) => {
+  state.launch.sel = ev.target.value;
+  renderLaunch();
+});
+$("ldlg-obj").addEventListener("input", renderLaunch);
+$("ldlg-ack").addEventListener("change", renderLaunch);
+$("ldlg-primary").addEventListener("click", (ev) => {
+  const L = state.launch;
+  if (ev.currentTarget.getAttribute("aria-disabled") === "true") return;
+  if (L.step === "form") {
+    L.step = "review";
+    $("ldlg-err").hidden = true;
+    renderLaunch();
+    $("ldlg-ack").focus();
+  } else submitLaunch();
+});
+$("ldlg-back").addEventListener("click", () => {
+  state.launch.step = "form";
+  $("ldlg-ack").checked = false;
+  $("ldlg-err").hidden = true;
+  renderLaunch();
+  $("ldlg-obj").focus();
+});
+$("ldlg-cancel").addEventListener("click", () => {
+  if (!state.launch.sending) closeLaunch();
+});
+$("ldlg").addEventListener("cancel", (ev) => {
+  if (state.launch.sending) ev.preventDefault();
+});
+$("ldlg").addEventListener("close", () => {
+  const L = state.launch;
+  L.seq++; // drop any option load still in flight
+  if (L.done) return;
+  // The invoker can be hidden by the time the dialog closes (list pane at <960px); fall back to Refresh.
+  L.invoker?.focus({ preventScroll: true });
+  if (document.activeElement !== L.invoker) $("refresh").focus({ preventScroll: true });
+});
 $("acts").addEventListener("click", (ev) => {
   const btn = ev.target.closest("[data-action]");
   if (!btn || btn.getAttribute("aria-disabled") === "true") return;

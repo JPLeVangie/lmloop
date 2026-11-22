@@ -66,3 +66,43 @@ release, repoint `current` and `systemctl --user restart lmloop-rust-web lmloop-
 systemd-analyze verify --user ./lmloop-rust-web.service ./lmloop-rust-edge.service
 ```
 (`ExecStart` paths are reported missing until a release exists.)
+
+## New run (scratch only; not enabled in live units)
+
+Browser launch of a new run exists in source for scratch use. Neither unit above
+enables it, and no unit flag or rollout turns it on. Background: [Native pilot
+run](../README.md#native-pilot-run), [Basic TUI](../README.md#basic-tui),
+[Auth edge, units and CI](../README.md#auth-edge-units-and-ci).
+
+**Inputs**
+
+- An explicit state root, a `0600` `--auth-file` and a `0600` `--launch-registry` (version 1). `--launch-registry` without `--auth-file` is refused at startup.
+- The registry points at private, external, single-task manifests. The registry is read at startup only. The manifests are reread on both review and launch.
+- Each manifest carries a reviewed repository-relative scope and caps. See [Worker watchdog](../README.md#worker-watchdog-opt-in) for the caps.
+- Template scopes are checked with `git::check_scope`. An invalid scope makes the template unusable ("the project template is not usable"). So does a template with no room for a 4096-byte objective.
+- The watchdog progress file must be zero-byte at preflight and again at launch, on both options. An absent, partial or used file makes the run ineligible ("the worker progress file is not fresh or usable"). `Dog::start` applies the same zero-byte check.
+
+**Behaviour**
+
+- Launch goes through the edge's authenticated browser session. Nothing else can start a run. (A direct call to the backend uses Basic auth instead.)
+- `202` means the run was published. `504` means the outcome is uncertain. Check the run list. Nothing retries automatically.
+- STOP-NOW takes effect immediately, except while a commit is being published.
+- Failed or stopped edits are kept. There is no resume, merge or deploy.
+- One run slot per server process. It is not a cross-process checkout lock, so two servers can still collide on one checkout.
+- The worker edits the approved checkout in place. The review screen says so and labels the field "Policy revision".
+
+**Production gate.** All of these must hold before this runs in a live unit, and Pierce must approve it:
+
+- A pinned, isolated launcher and relay that protect state, auth and config, and make no auxiliary inference calls.
+- A fresh watchdog file for each run, provisioned per run. A nonempty or unusable file is rejected. A static path passes if the file is zero-byte, but production still requires a fresh file each run.
+- Immutable gate and tooling.
+- An exclusive checkout, with cross-process exclusion.
+- Policy approval and a rollout decision.
+
+**Tested so far.** Parent-verified final pass, after the follow-ups above landed. All of it is scratch and local; none of it ran in a live unit.
+
+- Full local suite green: `cargo fmt --check`, `clippy -D warnings`, 140 Rust tests (15 in web), gateway 41 (including a real-Rust dirty-checkout refusal with HEAD and the edit preserved), `sse_progress` 14, Node 29, `git diff --check` clean.
+- Fresh Chromium rerun against the rebuilt binary, at 390x844 and 1440x900: one POST returning 202 each, no POST before acknowledgement, no overflow or page errors, run detail "1 of 1 committed". Scratch commits `695fa4e` (tree `86952012`) and `4a230148` (tree `63845ff1`) each match `snapshot_captured` and the `commit_intent` tree with the gate passed. Only `notes/objective.txt` changed. The scratch repo is clean and all QA listeners are down.
+- Live stays login-only, a release without this feature, and healthy.
+
+**Still open.** Cross-process exclusion or an exclusive checkout, a pinned isolated launcher and relay, per-run watchdog provisioning, policy approval and rollout, a real device, and hosted CI.

@@ -298,6 +298,15 @@ pub fn load_private_pilot_manifest(path: &Path) -> std::result::Result<Policy, S
     parse(&text, true)
 }
 
+/// A one-task pilot template with the requester's objective appended to the task prompt,
+/// revalidated (so the prompt size cap still holds). Only the prompt changes.
+pub fn with_objective(mut p: Policy, objective: &str) -> std::result::Result<Policy, String> {
+    let t = p.tasks.first_mut().ok_or("template has no task")?;
+    t.prompt = format!("{}\n\nObjective:\n{objective}", t.prompt);
+    validate(&p, true)?;
+    Ok(p)
+}
+
 fn load(path: &Path, pilot: bool) -> std::result::Result<Policy, String> {
     let mut text = String::new();
     File::open(path)
@@ -762,7 +771,7 @@ impl<'a> Dog<'a> {
         first_task: bool,
     ) -> Result<Self> {
         let progress = Progress::open(&cfg.progress_file, repo)?;
-        if first_task && progress.baseline() != 0 {
+        if first_task && !progress.was_empty_at_open() {
             return Err(Error::new(
                 "progress_unsafe",
                 format!(

@@ -6,6 +6,7 @@ pub mod gate;
 pub mod git;
 pub mod lease;
 pub mod operator;
+pub mod project;
 pub mod protocol;
 pub mod serial;
 pub mod state;

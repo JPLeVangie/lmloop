@@ -179,7 +179,7 @@ fn utf8(bytes: &[u8]) -> Result<String> {
 }
 
 /// Literal, relative, normalised, outside `.git`; never a glob or a pathspec magic.
-fn check_scope(s: &str) -> Result<()> {
+pub fn check_scope(s: &str) -> Result<()> {
     let bad = s.is_empty()
         || s.starts_with('/')
         || s.ends_with('/')

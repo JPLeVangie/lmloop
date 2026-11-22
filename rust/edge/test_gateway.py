@@ -237,7 +237,6 @@ class TestReads(EdgeCase):
         for m in ("PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"):
             self.assertEqual(self.call(m, "/api/runs", self.post_headers())[0], 405, m)
         self.assertEqual(Backend.seen, [])
-        self.assertEqual(self.call("POST", "/api/runs", self.post_headers(), b"{}")[0], 404)
         self.assertEqual(self.call("POST", "/health")[0], 404)
         self.assertEqual(Backend.seen, [])
 
@@ -384,7 +383,7 @@ class TestWrites(EdgeCase):
     def test_target_grammar_for_writes(self):
         h = self.post_headers()
         for p in ("/api/runs/r1/resume", "/api/runs/r1/control?x=1", "/api/runs/r1/decision?x=1", "/api/runs/../control",
-                  "/api/runs/lmloop/r1/control", "/api/runs/r1/control/", "/api/runs/r%31/control", "/api/runs", "/api/projects",
+                  "/api/runs/lmloop/r1/control", "/api/runs/r1/control/", "/api/runs/r%31/control", "/api/runs/", "/api/runs?x=1", "/api/projects",
                   "/api/runs/r1/preview", "/api/system-prompt", "/api/push/subscribe", "/api/runs/-r1/control"):
             self.assertEqual(self.call("POST", p, h, self.CTL)[0], 404, p)
         self.assertEqual(Backend.seen, [])
@@ -432,6 +431,190 @@ class TestWrites(EdgeCase):
         self.assertEqual((s, json.loads(d)), (502, {"error": "upstream_error"}))
 
 
+REV = "0123456789abcdef" * 2
+LAUNCH = json.dumps({"project": "demo", "objective": "add the file", "revision": REV}).encode()
+OPTIONS = {"enabled": True, "objective_max_bytes": 4096, "projects": [
+    {"id": "demo", "label": "Demo", "eligible": True, "scopes": ["src/one.txt", "a b/é.txt"], "revision": REV,
+     "budget": {"tasks": 1, "worker_timeout_secs": 30, "worker_startup_secs": None, "worker_idle_secs": None, "gate_timeout_secs": 30}}]}
+
+
+def typed(d):
+    """The one error shape the page parses: {error:{kind,message}} and nothing else."""
+    e = json.loads(d)["error"]
+    assert set(e) == {"kind", "message"} and all(isinstance(v, str) for v in e.values()), d
+    return e["kind"]
+
+
+class TestLaunch(EdgeCase):
+    P, O = "/api/runs", "/api/launch-options"
+
+    def setUp(self):
+        super().setUp()
+        Backend.routes[("POST", self.P)] = (202, "application/json", b'{"id":"web-1-2-3"}', {})
+        Backend.routes[("GET", self.O)] = (200, "application/json", json.dumps(OPTIONS).encode(), {})
+
+    def post(self, body=LAUNCH, **kw):
+        return self.call("POST", self.P, kw.pop("headers", None) or self.post_headers(), body)
+
+    def test_options_need_a_session_never_a_bearer_and_are_reprojected(self):
+        bh = {"Authorization": f"Bearer {DEVICE}"}
+        for h in ({}, bh, {**bh, **self.session_headers(sub=STRANGER)}):
+            s, _, d = self.call("GET", self.O, h)
+            self.assertEqual((s, typed(d)), (401, "authentication_required"), h)
+        self.assertEqual(self.call("GET", self.O, {**self.session_headers(), "Origin": "https://evil.example"})[0], 403)
+        self.assertEqual(self.call("GET", self.O + "?x=1", self.session_headers())[0], 404)
+        self.assertEqual(Backend.seen, [])
+        Backend.routes[("GET", self.O)] = (200, "application/json", json.dumps(
+            {**OPTIONS, "leak": "/home/x", "projects": [{**OPTIONS["projects"][0], "manifest": "/secret/m.json"}]}).encode(), {})
+        for h in (self.session_headers(), {**self.session_headers(), "Origin": ORIGIN, **bh}):   # a bearer beside a session is ignored
+            s, r, d = self.call("GET", self.O, h)
+            self.assertEqual((s, json.loads(d)), (200, OPTIONS))   # scopes pass through byte for byte; nothing extra
+            self.assertEqual(r.getheader("Cache-Control"), "no-store")
+        sent = {k.lower(): v for k, v in Backend.seen[-1]["headers"].items()}
+        self.assertEqual((Backend.seen[-1]["path"], sent["authorization"], sent["accept"]), (self.O, self.basic, "application/json"))
+        self.assertNotIn("cookie", sent)
+
+    def test_options_disabled_and_backend_surprises(self):
+        Backend.routes[("GET", self.O)] = (200, "application/json", b'{"enabled":false,"projects":[],"x":1}', {})
+        self.assertEqual(json.loads(self.call("GET", self.O, self.session_headers())[2]), {"enabled": False, "projects": []})
+        bad = ({**OPTIONS, "objective_max_bytes": "4096"}, {**OPTIONS, "projects": "x"}, [], {"enabled": True},
+               {**OPTIONS, "projects": [{"id": "../x", "label": "x", "eligible": False}]},
+               {**OPTIONS, "projects": [{**OPTIONS["projects"][0], "scopes": [{"a": 1}]}]},
+               {**OPTIONS, "projects": [{**OPTIONS["projects"][0], "budget": {"tasks": 1}}]},
+               {**OPTIONS, "projects": [{**OPTIONS["projects"][0], "revision": "x"}]},
+               {**OPTIONS, "projects": [{"id": "a", "label": "a", "eligible": True}]})
+        for body in bad:
+            Backend.routes[("GET", self.O)] = (200, "application/json", json.dumps(body).encode(), {})
+            s, _, d = self.call("GET", self.O, self.session_headers())
+            self.assertEqual((s, typed(d)), (502, "upstream_error"), body)
+        for raw in (b"[" * 5000, b"x", b"\xff"):
+            Backend.routes[("GET", self.O)] = (200, "application/json", raw, {})
+            self.assertEqual(self.call("GET", self.O, self.session_headers())[0], 502)
+        # an ineligible project keeps only a fixed reason, even if the backend's text is hostile or mistyped
+        for reason, want in (("the checkout has uncommitted changes", "the checkout has uncommitted changes"),
+                             ("/home/pierce/secret", "The project is not ready to launch."), ({"a": 1}, None), (["x"], None)):
+            p = {"id": "a", "label": "A", "eligible": False, "reason": reason}
+            Backend.routes[("GET", self.O)] = (200, "application/json", json.dumps({**OPTIONS, "projects": [p]}).encode(), {})
+            s, _, d = self.call("GET", self.O, self.session_headers())
+            self.assertEqual(s, 200)
+            self.assertEqual(json.loads(d)["projects"][0].get("reason"), want)
+
+    def test_every_launch_guard_blocks_before_the_backend(self):
+        ph = self.post_headers
+        cases = {
+            "anonymous": ({"Origin": ORIGIN, "Content-Type": "application/json", "X-CSRF-Token": "x"}, 401),
+            "bearer only": ({"Authorization": f"Bearer {DEVICE}", "Origin": ORIGIN, "Content-Type": "application/json"}, 401),
+            "bearer beside a session": (ph(Authorization=f"Bearer {DEVICE}"), 401),
+            "foreign sub": (ph() | self.session_headers(sub=STRANGER), 401),
+            "no origin": ({k: v for k, v in ph().items() if k != "Origin"}, 403),
+            "foreign origin": (ph(Origin="https://evil.example"), 403),
+            "backend origin": (ph(Origin=f"http://127.0.0.1:{self.backend_port}"), 403),
+            "no csrf": ({k: v for k, v in ph().items() if k != "X-CSRF-Token"}, 403),
+            "wrong csrf": (ph() | {"X-CSRF-Token": "nope"}, 403),
+            "cross-site": (ph() | {"Sec-Fetch-Site": "cross-site"}, 403),
+            "text/plain": (ph() | {"Content-Type": "text/plain"}, 415),
+        }
+        for name, (headers, want) in cases.items():
+            s, _, d = self.post(headers=headers)
+            self.assertEqual(s, want, name)
+            typed(d)
+        self.assertEqual(Backend.seen, [])
+
+    def test_body_is_exact_and_bounded(self):
+        j = lambda **kw: json.dumps({"project": "demo", "objective": "x", "revision": REV, **kw}).encode()  # noqa: E731
+        for body in (b"", b"{}", b"[]", b"null", b"{", j(argv=["sh"]), j(run_id="mine"), j(scope_set="x"), j(project="../x"),
+                     j(project="a b"), j(revision="abc"), j(revision=REV.upper()), j(objective=5), j(objective=None),
+                     b'{"project":"demo","revision":"' + REV.encode() + b'"}', b'{"project":"demo","project":"x","objective":"o","revision":"' + REV.encode() + b'"}',
+                     b'{"project":"demo","objective":"\\ud800","revision":"' + REV.encode() + b'"}', j() + b" {}", j() + b"\xff", b"[" * 5000):
+            s, _, d = self.post(body=body)
+            self.assertEqual((s, typed(d)), (400, "bad_request"), body[:60])
+        self.assertEqual(Backend.seen, [])
+        # 4096 UTF-8 bytes advertised, 8 KiB on the wire: an escaped-heavy objective is refused with a useful 413, cap unchanged
+        s, _, d = self.post(body=j(objective="\n" * 4096))
+        self.assertEqual((s, typed(d)), (413, "too_large"))
+        self.assertIn("4096", json.loads(d)["error"]["message"])
+        self.assertEqual(self.call("POST", "/api/runs/r1/control", self.post_headers(), b" " * 9000)[0], 413)   # others keep their reply
+        self.assertEqual(Backend.seen, [])
+        # a full 4096-byte multibyte objective fits and is forwarded unescaped, never larger than it arrived
+        obj = "\u00e9" * 2048
+        wire = json.dumps({"project": "demo", "objective": obj, "revision": REV}, ensure_ascii=False).encode()   # as a browser's JSON.stringify
+        self.assertEqual(self.post(body=wire)[0], 202)
+        sent = Backend.seen[-1]["body"]
+        self.assertEqual(json.loads(sent), {"project": "demo", "objective": obj, "revision": REV})
+        self.assertLessEqual(len(sent), len(wire))
+
+    def test_success_is_a_truthful_202_with_a_rebuilt_request(self):
+        h = self.post_headers() | {"Sec-Fetch-Site": "same-origin", "X-Forwarded-User": "root", "Referer": "https://evil.example/"}
+        s, r, d = self.call("POST", self.P, h, b' { "revision" : "%s", "project":"demo", "objective":"add the file" } ' % REV.encode())
+        self.assertEqual((s, json.loads(d)), (202, {"id": "web-1-2-3"}))
+        self.assertEqual(len(Backend.seen), 1)
+        seen = Backend.seen[0]
+        self.assertEqual((seen["method"], seen["path"]), ("POST", self.P))
+        self.assertEqual(json.loads(seen["body"]), {"project": "demo", "objective": "add the file", "revision": REV})
+        sent = {k.lower(): v for k, v in seen["headers"].items()}
+        self.assertEqual((sent["authorization"], sent["origin"], sent["host"]),
+                         (self.basic, f"http://127.0.0.1:{self.backend_port}", f"127.0.0.1:{self.backend_port}"))
+        self.assertTrue(set(sent) <= {"host", "authorization", "accept", "accept-encoding", "origin", "content-type", "content-length"}, sent)
+
+    def test_backend_errors_are_typed_and_fixed_never_relayed(self):
+        for status, kind in ((400, "usage"), (404, "no_project"), (404, "launch_disabled"), (409, "ineligible"),
+                             (409, "stale_revision"), (409, "busy"), (504, "launch_pending")):
+            Backend.routes[("POST", self.P)] = (status, "application/json", json.dumps(
+                {"error": {"kind": kind, "message": "/home/pierce/secret objective=hunter2"}}).encode(), {})
+            s, _, d = self.post()
+            self.assertEqual((s, typed(d)), (status, kind))
+            self.assertNotIn(b"secret", d)
+            self.assertNotIn(b"hunter2", d)
+        # an ineligible reason is relayed only when it is one of Rust's fixed strings
+        Backend.routes[("POST", self.P)] = (409, "application/json", json.dumps(
+            {"error": {"kind": "ineligible", "message": "the checkout has uncommitted changes"}}).encode(), {})
+        self.assertEqual(json.loads(self.post()[2])["error"]["message"], "the checkout has uncommitted changes")
+        # anything else is the uncertain 502 (the run may exist), and a 202 must carry exactly a run id
+        for route in ((202, b'{"id":"../x"}'), (202, b'{"id":"a","x":1}'), (202, b"{}"), (202, b"x"), (202, b"[" * 5000),
+                      (409, b'{"error":{"kind":"weird","message":"x"}}'), (409, b'{"error":{"kind":["a"],"message":{"b":1}}}'),
+                      (409, b'{"error":{"kind":"ineligible","message":{"a":1}}}'), (409, b'{"error":"x"}'), (500, b"{}"),
+                      (302, b""), (404, b"x"), (400, b"[]")):
+            Backend.routes[("POST", self.P)] = (route[0], "application/json", route[1], {})
+            s, _, d = self.post()
+            if route[1].startswith(b'{"error":{"kind":"ineligible"'):
+                self.assertEqual((s, typed(d)), (409, "ineligible"))
+                self.assertEqual(json.loads(d)["error"]["message"], gateway.LAUNCH_MSG['ineligible'])
+            else:
+                self.assertEqual((s, typed(d)), (502, "upstream_error"), route)
+        Backend.routes[("POST", self.P)] = (202, "text/html", b'{"id":"a"}', {})
+        self.assertEqual(self.post()[0], 502)
+
+    def test_launch_wait_is_longer_than_rusts_and_a_dead_backend_is_uncertain(self):
+        self.assertGreater(gateway.LAUNCH_TIMEOUT, 10)   # Rust waits 10 s for the run to exist
+        self.assertLessEqual(gateway.LAUNCH_TIMEOUT, gateway.REQUEST_DEADLINE)
+        dead = socket.socket(); dead.bind(("127.0.0.1", 0)); port = dead.getsockname()[1]; dead.close()
+        object.__setattr__(self.cfg, "backend_port", port)
+        try:
+            s, _, d = self.post()
+            self.assertEqual((s, typed(d)), (502, "upstream_error"))
+        finally:
+            object.__setattr__(self.cfg, "backend_port", self.backend_port)
+
+    def test_launch_audit_never_logs_the_objective(self):
+        import contextlib, io
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.post(body=LAUNCH.replace(b"add the file", b"topsecretobjective"))
+            Backend.routes[("POST", self.P)] = (409, "application/json", b'{"error":{"kind":"busy","message":"topsecretobjective"}}', {})
+            self.post(body=LAUNCH.replace(b"add the file", b"topsecretobjective"))
+        text = err.getvalue()
+        self.assertEqual(len([l for l in text.splitlines() if "audit" in l]), 2)
+        self.assertIn("launch project=demo status=202", text)
+        for leak in ("topsecretobjective", REV, OPERATOR):
+            self.assertNotIn(leak, text)
+
+    def test_resume_and_other_routes_stay_closed(self):
+        for p in ("/api/runs/web-1/resume", "/api/runs/web-1", "/api/launch-options"):
+            self.assertEqual(self.call("POST", p, self.post_headers(), LAUNCH)[0], 404, p)
+        self.assertEqual(self.call("GET", "/api/launch-options/x", self.session_headers())[0], 404)
+        self.assertEqual(Backend.seen, [])
+
+
 class TestLogin(EdgeCase):
     def setUp(self):
         super().setUp()
@@ -467,6 +650,28 @@ class TestLogin(EdgeCase):
         self.assertIn(b'href="/login/start"', d)
         self.assertEqual(self.call("GET", "/logout")[0], 200)   # works with no session at all
         self.assertEqual(self.call("POST", "/logout", self.post_headers(), b"{}")[0], 404)
+        self.assertEqual(Backend.seen, [])
+
+    def test_sign_in_page_is_styled_from_exact_anonymous_local_assets(self):
+        s, r, d = self.call("GET", "/login")
+        self.assertIn(b'href="/login.css"', d)
+        self.assertIn(b'class="moon"', d)   # the crescent
+        self.assertIn(b"Sign in to start", d)
+        self.assertNotIn(b"<script", d)
+        self.assertNotIn(b"http", d.replace(b"http://www.w3.org", b""))   # no third-party asset, no absolute URL
+        self.assertIn("style-src 'self'", r.getheader("Content-Security-Policy"))
+        self.assertIn(b"signed out", self.call("GET", "/logout")[2])
+        static = Path(gateway.__file__).resolve().parents[2] / "web" / "static"
+        for path, ctype, name in (("/login.css", "text/css; charset=utf-8", "login.css"), ("/favicon.png", "image/png", "favicon.png")):
+            s, r, d = self.call("GET", path)   # no cookie: anonymous
+            self.assertEqual((s, r.getheader("Content-Type"), d), (200, ctype, (static / name).read_bytes()))
+            self.assertEqual((r.getheader("X-Content-Type-Options"), r.getheader("Set-Cookie")), ("nosniff", None))
+            self.assertEqual(self.call("GET", path + "?v=1")[0], 404)
+            self.assertEqual(self.call("POST", path, self.post_headers(), b"{}")[0], 404)
+        for p in ("/style.css", "/app.js.map", "/static/login.css", "/login.html", "/manifest.json", "/sw.js", "/icon.svg",
+                  "/apple-touch-icon.png", "/login.css/", "/LOGIN.CSS", "/%6cogin.css", "/../web/static/login.css"):
+            self.assertIn(self.call("GET", p)[0], (404, 400, 401), p)
+        self.assertEqual(self.call("GET", "/login.css", host="evil.example")[0], 421)
         self.assertEqual(Backend.seen, [])
 
     def stub(self, sub):
@@ -673,6 +878,132 @@ class TestRealRust(EdgeCase):
         # a control write is accepted by Rust (control file only), through the edge
         s, _, d = self.call("POST", "/api/runs/r1/control", self.post_headers(), b'{"control":"stop"}')
         self.assertIn(s, (200, 409), d)
+
+
+@unittest.skipUnless(BIN.exists(), "rust/target/debug/lmloop not built")
+class TestRealRustLaunch(EdgeCase):
+    """The edge in front of a real `lmloop web --launch-registry`: a fake worker in a scratch repo, never a model."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = Path(tempfile.mkdtemp())
+        cls.state, cls.repo = cls.tmp / "state", cls.tmp / "repo"
+        cls.repo.mkdir()
+        cls.state.mkdir(mode=0o700)   # Rust refuses a state root open to group/other writes
+        os.chmod(cls.state, 0o700)
+        env = {"GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1", "PATH": os.environ["PATH"]}
+        cls.git = staticmethod(lambda *a: subprocess.run(["git", *a], cwd=cls.repo, env=env, capture_output=True, check=True).stdout.decode().strip())
+        cls.git("init", "-q", "-b", "main"); cls.git("config", "user.name", "t"); cls.git("config", "user.email", "t@example.invalid")
+        (cls.repo / "README").write_text("base\n"); cls.git("add", "-A"); cls.git("commit", "-q", "-m", "base")
+        bin_ = cls.tmp / "bin"
+        bin_.mkdir()
+        shutil.copy(FX / "fake-opencode", bin_ / "opencode")   # the launcher name a pilot template may use
+        cls.template, cls.registry = cls.tmp / "template.json", cls.tmp / "registry.json"
+        cls.set_mode("ok|src/one.txt|from-template")
+        cls.registry.write_text(json.dumps({"registry_version": 1, "projects": [{"id": "demo", "label": "Demo", "manifest": str(cls.template)}]}))
+        af = cls.tmp / "auth"
+        af.write_text("be-user:be-pass\n")
+        for f in (af, cls.registry):
+            os.chmod(f, 0o600)
+        cls.proc = subprocess.Popen([BIN, "--state-root", cls.state, "web", "--port", "0", "--auth-file", af,
+                                     "--launch-registry", cls.registry], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+        addr = cls.proc.stdout.readline().strip().removeprefix("listening on http://").removesuffix("/")
+        cls.backend_port = int(addr.rsplit(":", 1)[1])
+        cls.backend_srv = None
+        cls.start_edge()
+
+    @classmethod
+    def set_mode(cls, mode):
+        cls.template.write_text(json.dumps({"manifest_version": 1, "repo": str(cls.repo),
+                                            "worker": {"argv": [str(cls.tmp / "bin/opencode")], "timeout_secs": 30},
+                                            "gate": {"argv": [str(FX / "gate-no-fail")], "timeout_secs": 30},
+                                            "tasks": [{"id": "t1", "prompt": mode, "scopes": ["src/one.txt"]}]}))
+        os.chmod(cls.template, 0o600)
+
+    @classmethod
+    def tearDownClass(cls):
+        super().tearDownClass()
+        cls.proc.terminate()
+        cls.proc.wait(10)
+        shutil.rmtree(cls.tmp, True)
+
+    def launch(self, rev, objective="add the file", project="demo"):
+        body = json.dumps({"project": project, "objective": objective, "revision": rev}).encode()
+        s, _, d = self.call("POST", "/api/runs", self.post_headers(), body)
+        return s, json.loads(d)
+
+    def option(self):
+        s, _, d = self.call("GET", "/api/launch-options", self.session_headers())
+        self.assertEqual(s, 200, d)
+        return json.loads(d)
+
+    def wait(self, run, phase):
+        end = time.monotonic() + 30
+        while time.monotonic() < end:
+            v = json.loads(self.call("GET", f"/api/runs/{run}", self.session_headers())[2])
+            if v["phase"] == phase:
+                return v
+            time.sleep(0.1)
+        self.fail(f"{run} never reached {phase}")
+
+    def test_launch_through_the_edge_stale_stop_and_refusals(self):
+        opts = self.option()
+        self.assertEqual((opts["enabled"], opts["objective_max_bytes"]), (True, 4096))
+        demo = opts["projects"][0]
+        self.assertEqual((demo["id"], demo["eligible"], demo["scopes"]), ("demo", True, ["src/one.txt"]))
+        self.assertNotIn(str(self.tmp), json.dumps(opts))
+        self.assertEqual(self.call("GET", "/api/launch-options", {"Authorization": f"Bearer {DEVICE}"})[0], 401)
+        head, rev = self.git("rev-parse", "HEAD"), demo["revision"]
+        # refusals create nothing
+        for (status, kind), args in (((409, "stale_revision"), ("0" * 32,)), ((404, "no_project"), (rev, "x", "nope")),
+                                     ((400, "usage"), (rev, "  ")), ((400, "usage"), (rev, "bad\u001b[31m"))):
+            s, d = self.launch(*args)
+            self.assertEqual((s, d["error"]["kind"]), (status, kind), d)
+            self.assertEqual(set(d["error"]), {"kind", "message"})
+        self.assertFalse((self.state / "v1/runs").exists())
+        s, d = self.launch(rev, "x" * 4097)   # over Rust's objective cap, under the wire cap: Rust's own refusal, typed
+        self.assertEqual((s, d["error"]["kind"]), (400, "usage"))
+        # success: 202 {id}, then the real run commits through the gate
+        s, d = self.launch(rev)
+        self.assertEqual((s, set(d)), (202, {"id"}), d)
+        run = d["id"]
+        self.assertEqual(self.wait(run, "complete")["kind"], "serial_pilot")
+        self.assertNotEqual(self.git("rev-parse", "HEAD"), head)
+        self.assertEqual((self.repo / "src/one.txt").read_text(), "from-template\n")
+        # the objective reached the template prompt but is in no edge-visible output; a bearer cannot launch
+        s, _, d = self.call("POST", "/api/runs", self.post_headers(Authorization=f"Bearer {DEVICE}"), LAUNCH)
+        self.assertEqual(s, 401)
+        # dirty checkout: refused with Rust's fixed reason, creates no run, and the operator's edit is left untouched
+        head, runs = self.git("rev-parse", "HEAD"), sorted(p.name for p in (self.state / "v1/runs").iterdir())
+        (self.repo / "src/one.txt").write_text("operator edit\n")
+        s, d = self.launch(self.option()["projects"][0]["revision"])
+        self.assertEqual((s, d["error"]["kind"], d["error"]["message"]), (409, "ineligible", "the checkout has uncommitted changes"), d)
+        self.assertEqual(sorted(p.name for p in (self.state / "v1/runs").iterdir()), runs)
+        self.assertEqual((self.repo / "src/one.txt").read_text(), "operator edit\n")
+        self.assertEqual((self.git("rev-parse", "HEAD"), self.git("status", "--porcelain")), (head, "M src/one.txt"))
+        (self.repo / "src/one.txt").write_text("from-template\n")   # restore only the fixture file to continue
+        self.assertEqual(self.git("status", "--porcelain"), "")
+        # stale: the operator changes the template after review, so the old revision is refused
+        self.set_mode("slow|src/one.txt|x")
+        s, d = self.launch(rev)
+        self.assertEqual((s, d["error"]["kind"]), (409, "stale_revision"))
+        rev = self.option()["projects"][0]["revision"]
+        self.assertNotEqual(rev, demo["revision"])
+        # stop: a slow worker, one launch at a time (busy), STOP-NOW through the edge ends it
+        head = self.git("rev-parse", "HEAD")
+        s, d = self.launch(rev)
+        self.assertEqual(s, 202, d)
+        run = d["id"]
+        end = time.monotonic() + 20
+        while json.loads(self.call("GET", f"/api/runs/{run}", self.session_headers())[2])["actions"]["stop_now"]["available"] is not True:
+            self.assertLess(time.monotonic(), end, "worker never started")
+            time.sleep(0.1)
+        s, d = self.launch(rev)
+        self.assertEqual((s, d["error"]["kind"]), (409, "busy"))
+        s, _, d = self.call("POST", f"/api/runs/{run}/control", self.post_headers(), b'{"control":"stop_now"}')
+        self.assertEqual(s, 200, d)
+        self.wait(run, "stopped")
+        self.assertEqual(self.git("rev-parse", "HEAD"), head)   # a stop commits nothing
 
 
 if __name__ == "__main__":

@@ -97,6 +97,11 @@ struct WebArgs {
     /// HTTPS origin served by a same-host TLS proxy (requires --auth-file)
     #[arg(long, value_name = "ORIGIN")]
     public_origin: Option<String>,
+    /// Opt in to the dashboard's "New run": a private (0600) registry of operator-owned one-task
+    /// pilot manifests; needs an explicit --state-root and --auth-file. Without it the server
+    /// launches nothing.
+    #[arg(long, value_name = "FILE")]
+    launch_registry: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -223,11 +228,17 @@ fn dispatch(cli: Cli, explicit_root: bool) -> Result<u8, Error> {
             Ok(0)
         }
         Cmd::Web(a) => {
+            if a.launch_registry.is_some() && !explicit_root {
+                return Ok(usage_error(
+                    "--launch-registry requires an explicit --state-root",
+                ));
+            }
             crate::web::run(
                 &state::resolve_root(cli.state_root)?,
                 a.port,
                 a.auth_file.as_deref(),
                 a.public_origin.as_deref(),
+                a.launch_registry.as_deref(),
             )?;
             Ok(0)
         }

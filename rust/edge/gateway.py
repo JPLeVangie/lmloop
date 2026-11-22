@@ -21,8 +21,11 @@ Routes (everything else is 404):
                 GET /api/runs/<id>/logs/<name>[?bytes=N]
                 POST /api/runs/<id>/control   {"control": pause|stop|stop_now}
                 POST /api/runs/<id>/decision  {"decision": approved|changes_requested, "note"?}
+                GET /api/launch-options   (New run review data, re-typed from the allowlisted fields)
+                POST /api/runs  {"project","objective","revision"}  (exactly these; bearer never; typed errors)
   bearer|session GET /api/config  /api/runs  /api/runs/lmloop/<id>   (Android)
   open          GET /login (sign-in page, no redirect), /logout (clears this edge's cookies, then the same page)
+                GET /login.css, /favicon.png (exact files from tracked web/static, no query; nothing else)
 No resume, no query string other than the log `bytes`.  /logout never redirects
 to /login/start or the issuer: an automatic SSO round trip would undo it.
 Decisions are recorded-only by the Rust side; this edge adds no approval power.
@@ -84,9 +87,23 @@ LEGACY_COOKIE = "lmloop_session"   # the Python dashboard's name; never read her
 BEARER = re.compile(r"Bearer ([\x21-\x7e]{1,512})")
 TOKEN = re.compile(r"[\x21-\x7e]{32,256}")
 LABEL = re.compile(r"[a-z0-9][a-z0-9_-]{0,31}")
-SIGN_IN = (b'<!doctype html><html lang="en"><head><meta charset="utf-8"><title>lmloop - sign in</title>'
-           b'<meta name="viewport" content="width=device-width, initial-scale=1"></head><body>'
-           b'<main><h1>lmloop</h1><p>You are signed out.</p><p><a href="/login/start">Sign in</a></p></main></body></html>')
+# The sign-in page mirrors tracked web/static/login.html (crescent drawn in CSS) minus its inline script,
+# manifest and PWA tags, which the CSP and this edge's closed route set would refuse anyway.
+_SIGN_IN = ('<!doctype html><html lang="en"><head><meta charset="utf-8">'
+            '<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">'
+            '<meta name="theme-color" content="#0c0c0f"><link rel="icon" href="/favicon.png" sizes="32x32">'
+            '<title>lmloop \u2014 sign in</title><link rel="stylesheet" href="/login.css"></head><body>'
+            '<main class="card"><div class="sky" aria-hidden="true"><div class="moon"><span></span></div>'
+            '<i class="star s1"></i><i class="star s2"></i><i class="star s3"></i><i class="star s4"></i></div>'
+            '<p class="eyebrow">slow models \u00b7 long nights</p><h1>lmloop</h1><p class="sub">%s</p>'
+            '<a class="btn" href="/login/start"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-1 17.93c-3.95-.49-7-3.85-7-7.93 0-.62.08-1.21.21-1.79L9 15v1c0 1.1.9 2 2 2v1.93zm6.9-2.54c-.26-.81-1-1.39-1.9-1.39h-1v-3c0-.55-.45-1-1-1H8v-2h2c.55 0 1-.45 1-1V7h2c1.1 0 2-.9 2-2v-.41c2.93 1.19 5 4.06 5 7.41 0 2.08-.8 3.97-2.1 5.39z"/></svg>'
+            'Sign in</a></main></body></html>')
+SIGN_IN = (_SIGN_IN % "Sign in to start, watch and steer your runs.").encode()
+SIGNED_OUT = (_SIGN_IN % "You are signed out.").encode()
+_STATIC = Path(__file__).resolve().parents[2] / "web" / "static"
+# Exact anonymous public files (no query, nothing else under web/static): path -> (content type, bytes read once at start)
+PUBLIC = {p: (t, (_STATIC / p[1:]).read_bytes())
+          for p, t in (("/login.css", "text/css; charset=utf-8"), ("/favicon.png", "image/png"))}
 SINGLETONS = ("Host", "Origin", "Cookie", "Authorization", "Content-Type", "Content-Length",
               "X-CSRF-Token", "Sec-Fetch-Site")
 CSP = ("default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; "
@@ -99,6 +116,38 @@ RID, LOG = r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", r"[A-Za-z0-9_-][A-Za-z0-9._-]{0,12
 CONTROLS = {"pause", "stop", "stop_now"}
 DECISIONS = {"approved", "changes_requested"}
 CALLBACK_KEYS = {"code", "state", "iss", "session_state", "error", "error_description"}
+RUN_ID = re.compile(RID)
+REVISION = re.compile(r"[0-9a-f]{32}")
+LAUNCH_KEYS = {"project", "objective", "revision"}
+BUDGET_KEYS = {"tasks", "worker_timeout_secs", "worker_startup_secs", "worker_idle_secs", "gate_timeout_secs"}
+LAUNCH_TIMEOUT = 14     # Rust waits up to 10 s for the run to exist; the default IO_TIMEOUT would race that answer
+LAUNCH_STATUSES = (202, 400, 404, 409, 504)
+# Reasons the Rust side may give for an unusable or ineligible project (fixed text, no paths).
+REASONS = frozenset({"the project template is not usable", "the checkout has uncommitted changes",
+                     "the checkout is not on a branch", "a Git operation is in progress in the checkout",
+                     "the checkout hides changes (assume-unchanged or skip-worktree)", "the checkout is not ready",
+                     "the worker progress file is not fresh or usable"})
+# Every launch error body is {"error":{"kind","message"}} with THESE messages: backend text is never relayed
+# (except an `ineligible` reason found in REASONS).  Kinds below the first group are the only backend refusals relayed.
+LAUNCH_MSG = {
+    "usage": "The objective was not accepted: it must be non-empty text of at most 4096 bytes without control characters other than newline and tab.",
+    "no_project": "No such project.",
+    "launch_disabled": "This server has no launch registry.",
+    "ineligible": "The project is not ready to launch.",
+    "stale_revision": "The project's policy changed since it was reviewed; reload and review again.",
+    "busy": "A launch or resume is already running; try again when it ends.",
+    "launch_pending": "The launch has not created its run yet; check the run list before retrying.",
+    "authentication_required": "Sign in again.",
+    "bad_origin": "The request origin was refused.",
+    "bad_csrf": "The session token was refused; reload the page.",
+    "bad_content_type": "The request must be application/json.",
+    "bad_request": "The request must be a JSON object with exactly project, objective and revision.",
+    "too_large": "The request is over the 8 KiB limit. An objective of up to 4096 bytes can still exceed it once JSON-escaped; shorten it.",
+    "not_found": "Not found.",
+    "upstream_error": "The server gave no usable answer. The run may or may not have started; check the run list before retrying.",
+}
+LAUNCH_REFUSALS = {(400, "usage"), (404, "no_project"), (404, "launch_disabled"), (409, "ineligible"),
+                   (409, "stale_revision"), (409, "busy"), (504, "launch_pending")}
 
 # (method, full-match path regex, kind).  The whole target grammar lives here.
 ROUTES = [
@@ -106,9 +155,12 @@ ROUTES = [
     ("GET", r"/login/start", "login"),
     ("GET", r"/login", "signin"),
     ("GET", r"/logout", "logout"),
+    ("GET", "|".join(re.escape(p) for p in PUBLIC), "public"),
     ("GET", r"/oauth/callback", "callback"),
     ("GET", r"/|/app\.css|/app\.js", "asset"),
     ("GET", r"/api/config|/api/runs|/api/runs/lmloop/" + RID, "android"),
+    ("GET", r"/api/launch-options", "launch_options"),
+    ("POST", r"/api/runs", "launch"),
     ("GET", r"/api/runs/" + RID, "session"),
     ("GET", rf"/api/runs/{RID}/logs/{LOG}", "log"),
     ("POST", rf"/api/runs/{RID}/control", "control"),
@@ -259,6 +311,80 @@ def parse_write(kind, raw):
     return json.dumps(data, separators=(",", ":")).encode() if ok else None
 
 
+def parse_launch(raw):
+    """The re-serialised launch body: exactly project, objective, revision (nothing defaulted or added), or None.
+
+    ensure_ascii=False keeps it no larger than what was received, so Rust's own 8 KiB cap is never newly hit."""
+    try:
+        data = json.loads(raw.decode("utf-8"), object_pairs_hook=_no_dup_keys)
+        if not isinstance(data, dict) or set(data) != LAUNCH_KEYS or not all(isinstance(v, str) for v in data.values()):
+            return None
+        if not RUN_ID.fullmatch(data["project"]) or not REVISION.fullmatch(data["revision"]):
+            return None
+        return json.dumps(data, separators=(",", ":"), ensure_ascii=False).encode("utf-8")   # a lone surrogate raises
+    except (ValueError, UnicodeError, RecursionError):
+        return None
+
+
+def launch_reply(status, data):
+    """(status, body) for the browser from the backend's launch answer: 202 {id} or a fixed-text typed error.
+
+    Anything unrecognised is the uncertain 502 upstream_error: the run may exist.  Never raises."""
+    uncertain = (502, {"error": {"kind": "upstream_error", "message": LAUNCH_MSG["upstream_error"]}})
+    try:
+        d = json.loads(data)
+    except (ValueError, RecursionError):
+        return uncertain
+    if status == 202:
+        ok = isinstance(d, dict) and set(d) == {"id"} and isinstance(d["id"], str) and RUN_ID.fullmatch(d["id"])
+        return (202, {"id": d["id"]}) if ok else uncertain
+    e = d.get("error") if isinstance(d, dict) else None
+    kind = e.get("kind") if isinstance(e, dict) else None
+    if not isinstance(kind, str) or (status, kind) not in LAUNCH_REFUSALS:
+        return uncertain
+    reason = e.get("message")
+    msg = reason if kind == "ineligible" and isinstance(reason, str) and reason in REASONS else LAUNCH_MSG[kind]
+    return status, {"error": {"kind": kind, "message": msg}}
+
+
+def clean_options(raw):
+    """Projection of Rust's /api/launch-options onto its known fields and types, or None for any other shape.
+
+    Policy (label, scopes, budget values) is Rust's to validate; scopes pass through untouched.  Never raises."""
+    try:
+        d = json.loads(raw)
+    except (ValueError, RecursionError):
+        return None
+    projects = d.get("projects") if isinstance(d, dict) else None
+    if not isinstance(projects, list):
+        return None
+    if d.get("enabled") is False:
+        return {"enabled": False, "projects": []}
+    cap = d.get("objective_max_bytes")
+    if d.get("enabled") is not True or type(cap) is not int:
+        return None
+    out = []
+    for p in projects:
+        if not (isinstance(p, dict) and isinstance(p.get("id"), str) and RUN_ID.fullmatch(p["id"])
+                and isinstance(p.get("label"), str) and isinstance(p.get("eligible"), bool)):
+            return None
+        q = {"id": p["id"], "label": p["label"], "eligible": p["eligible"]}
+        reason = p.get("reason")
+        if isinstance(reason, str):
+            q["reason"] = reason if reason in REASONS else LAUNCH_MSG["ineligible"]
+        if "revision" in p:
+            sc, bd, rev = p.get("scopes"), p.get("budget"), p["revision"]
+            if not (isinstance(sc, list) and all(isinstance(x, str) for x in sc) and isinstance(bd, dict)
+                    and set(bd) == BUDGET_KEYS and all(v is None or type(v) is int for v in bd.values())
+                    and isinstance(rev, str) and REVISION.fullmatch(rev)):
+                return None
+            q.update(scopes=sc, budget=bd, revision=rev)
+        elif q["eligible"]:
+            return None
+        out.append(q)
+    return {"enabled": True, "objective_max_bytes": cap, "projects": out}
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.0"   # one request per connection: no pipelining or smuggling surface
     timeout = IO_TIMEOUT
@@ -279,6 +405,10 @@ class Handler(BaseHTTPRequestHandler):
         try:
             body = json.loads(clean)
             actor = hashlib.sha256(str(session["sub"]).encode("utf-8", "replace")).hexdigest()[:12]
+            if kind == "launch":   # project id and outcome only: never the objective
+                print(f"lmloop edge: audit actor={actor} launch project={body['project']} status={status}",
+                      file=sys.stderr, flush=True)
+                return
             extra = f" note_bytes={len(body['note'].encode())}" if "note" in body else ""
             print(f"lmloop edge: audit actor={actor} run={path.split('/')[3]} {kind}={body[kind]}{extra} status={status}",
                   file=sys.stderr, flush=True)
@@ -299,6 +429,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def err(self, status, code, extra=()):
         self.send(status, {"error": code}, extra=extra)
+
+    def lerr(self, status, code, extra=()):   # launch routes: the typed {error:{kind,message}} shape the page parses
+        self.send(status, {"error": {"kind": code, "message": LAUNCH_MSG[code]}}, extra=extra)
 
     def send_error(self, code, message=None, explain=None):   # stdlib's HTML error pages leak nothing, but stay generic
         self.close_connection = True
@@ -362,8 +495,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.err(421, "bad_host")
         if method == "GET" and length:
             return self.err(400, "bad_request")
-        if length > MAX_BODY:
-            return self.err(413, "too_large")
+        if length > MAX_BODY:   # the same cap everywhere; only the launch page gets a message it can show
+            return (self.lerr if self.requestline.split(" ")[:2] == ["POST", "/api/runs"] else self.err)(413, "too_large")
         body = self.rfile.read(length) if length else b""   # drained first so error replies are not cut by a reset
         if len(body) != length:
             return self.err(400, "bad_request")
@@ -387,10 +520,12 @@ class Handler(BaseHTTPRequestHandler):
             return self.login() if not query else self.err(404, "not_found")
         if kind in ("signin", "logout"):
             return self.signin(kind == "logout") if not query else self.err(404, "not_found")
+        if kind == "public":
+            return self.send(200, PUBLIC[path][1], PUBLIC[path][0]) if not query else self.err(404, "not_found")
         if kind == "callback":
             return self.callback(query)
-        if kind in ("control", "decision"):
-            return self.write(kind, path, body) if not query else self.err(404, "not_found")
+        if kind in ("control", "decision", "launch"):
+            return self.write(kind, path, body) if not query else (self.lerr if kind == "launch" else self.err)(404, "not_found")
 
         # reads
         identity = None
@@ -399,6 +534,12 @@ class Handler(BaseHTTPRequestHandler):
             label = self.server.devices.match(auth) if BEARER.fullmatch(auth) else None
             if label:
                 identity = {"name": f"device:{label}", "csrf": "disabled", "bearer": True}
+        if kind == "launch_options":   # session only, never the bearer; Origin is optional on a GET but must match if sent
+            if h.get("Origin") not in (None, self.cfg.public_origin):
+                return self.lerr(403, "bad_origin")
+            identity = self.session()
+            if identity is None:
+                return self.lerr(401, "authentication_required")
         if identity is None:
             identity = self.session()
         if identity is None:
@@ -411,9 +552,14 @@ class Handler(BaseHTTPRequestHandler):
                 return self.err(404, "not_found")
             target = path + (f"?bytes={int(m.group(1))}" if m.group(1) else "")
         elif query:
-            return self.err(404, "not_found")
+            return (self.lerr if kind == "launch_options" else self.err)(404, "not_found")
         expect = ASSETS.get(path, JSON)
         status, data = self.forward("GET", target, "*/*" if path in ASSETS else JSON, expect)
+        if kind == "launch_options":   # only the re-typed allowlisted fields ever reach the browser
+            opts = clean_options(data) if status == 200 else None
+            if opts is None:
+                return self.lerr(502, "upstream_error")
+            return self.send(200, opts)
         if path == "/api/config" and status == 200:
             try:
                 cfg = json.loads(data)
@@ -436,7 +582,7 @@ class Handler(BaseHTTPRequestHandler):
             cookies = [("Set-Cookie", self.cookie(SESSION_COOKIE, "", "/", 0)),
                        ("Set-Cookie", self.cookie(LEGACY_COOKIE, "", "/", 0)),
                        ("Set-Cookie", self.cookie(OIDC_COOKIE, "", "/oauth/callback", 0))]
-        self.send(200, SIGN_IN, HTML, extra=cookies)
+        self.send(200, SIGNED_OUT if clear else SIGN_IN, HTML, extra=cookies)
 
     def login(self):
         try:
@@ -471,28 +617,35 @@ class Handler(BaseHTTPRequestHandler):
     # -- writes ---------------------------------------------------------
     def write(self, kind, path, body):
         h = self.headers
+        launch = kind == "launch"
+        err = self.lerr if launch else self.err
         if h.get("Authorization") is not None:   # bearer tokens (device_auth) can never reach a write
-            return self.err(401, "authentication_required")
+            return err(401, "authentication_required")
         session = self.session()
         if session is None:
-            return self.err(401, "authentication_required")
+            return err(401, "authentication_required")
         if h.get("Origin") != self.cfg.public_origin:
-            return self.err(403, "bad_origin")
+            return err(403, "bad_origin")
         if h.get("Sec-Fetch-Site") not in (None, "same-origin"):
-            return self.err(403, "bad_origin")
+            return err(403, "bad_origin")
         if not hmac.compare_digest(h.get("X-CSRF-Token", "").encode("utf-8", "replace"), session["csrf"].encode()):
-            return self.err(403, "bad_csrf")
+            return err(403, "bad_csrf")
         if (h.get("Content-Type") or "").split(";")[0].strip().lower() != JSON:
-            return self.err(415, "bad_content_type")
-        clean = parse_write(kind, body)
+            return err(415, "bad_content_type")
+        clean = parse_launch(body) if launch else parse_write(kind, body)
         if clean is None:
-            return self.err(400, "bad_request")
+            return err(400, "bad_request")
+        if launch:   # Rust answers within its 10 s launch wait; a slower or odd answer is the uncertain 502
+            status, data = self.forward("POST", path, JSON, JSON, clean, LAUNCH_STATUSES, LAUNCH_TIMEOUT)
+            status, out = launch_reply(status, data)
+            self.audit(session, kind, path, status, clean)
+            return self.send(status, out)
         status, data = self.forward("POST", path, JSON, JSON, clean)
         self.audit(session, kind, path, status, clean)
         self.send(status, data)
 
     # -- upstream -------------------------------------------------------
-    def forward(self, method, target, accept, expect, body=None):
+    def forward(self, method, target, accept, expect, body=None, statuses=(200, 400, 404, 409), timeout=IO_TIMEOUT):
         """Rebuild and send one upstream request: (status, bytes), or (502, generic body) on any surprise.
 
         http.client never follows redirects; a redirect is a non-allowed status here."""
@@ -501,12 +654,12 @@ class Handler(BaseHTTPRequestHandler):
         if body is not None:
             headers.update({"Origin": f"http://{c.backend_authority}", "Content-Type": JSON})
         left = self.remaining()
-        conn = http.client.HTTPConnection("127.0.0.1", c.backend_port, timeout=min(IO_TIMEOUT, left))
+        conn = http.client.HTTPConnection("127.0.0.1", c.backend_port, timeout=min(timeout, left))
         try:
             conn.request(method, target, body=body, headers=headers)
             r = conn.getresponse()
             ok_type = (r.getheader("Content-Type") or "").split(";")[0].strip().lower() == expect.split(";")[0]
-            if r.status not in ((200,) if expect != JSON else (200, 400, 404, 409)) or not ok_type:
+            if r.status not in ((200,) if expect != JSON else statuses) or not ok_type:
                 raise UpstreamError
             data, deadline = b"", time.monotonic() + min(UPSTREAM_DEADLINE, self.remaining())
             while len(data) <= MAX_UPSTREAM:
