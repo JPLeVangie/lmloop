@@ -2116,3 +2116,44 @@ fn a_committing_resume_whose_checkout_lookup_fails_changes_nothing() {
     );
     assert_eq!(fs::read(log_path(&s)).unwrap(), log, "journal untouched");
 }
+
+#[test]
+fn the_pilot_hook_runs_under_the_checkout_guard_and_a_refusal_publishes_nothing() {
+    let s = Scratch::new("co-hook");
+    let m = s.manifest(&[("t1", "ok|src/one.txt|a")], 30);
+    let policy = || lmloop::serial::load_pilot_manifest(&m).unwrap();
+    let store = lmloop::state::Store::new(&s.0.join("state"));
+    let git_dir = lmloop::git::checkout_dir(&s.repo()).unwrap().unwrap();
+
+    // The hook sees the guard held (a second claim loses) and the run directory absent; its Err
+    // is the launch's result, with no run directory, worker or commit.
+    let head = s.head();
+    let mut ran = false;
+    let err = match lmloop::serial::start_pilot_guarded(&store, "r1", policy(), |_| {
+        ran = true;
+        assert!(lmloop::lease::claim_checkout(&git_dir).unwrap().is_none());
+        assert!(!s.0.join("state/v1/runs/r1").exists());
+        Err(lmloop::state::Error::new("ineligible", "no"))
+    }) {
+        Err(e) => e,
+        Ok(_) => panic!("a refused hook launched"),
+    };
+    assert!(ran);
+    assert_eq!(err.kind, "ineligible");
+    assert!(!s.0.join("state/v1/runs/r1").exists());
+    assert_eq!(s.head(), head);
+    assert!(
+        lmloop::lease::claim_checkout(&git_dir).unwrap().is_some(),
+        "the guard outlived a refused launch"
+    );
+
+    // A busy checkout never reaches the hook.
+    let held = checkout_guard(&s).unwrap();
+    let out = lmloop::serial::start_pilot_guarded(&store, "r2", policy(), |_| panic!("hook ran"));
+    assert!(matches!(out, Ok(lmloop::serial::Finish::CheckoutBusy)));
+    drop(held);
+
+    // An accepting hook lets the run go on.
+    let out = lmloop::serial::start_pilot_guarded(&store, "r3", policy(), |_| Ok(())).unwrap();
+    assert!(matches!(out, lmloop::serial::Finish::Complete));
+}

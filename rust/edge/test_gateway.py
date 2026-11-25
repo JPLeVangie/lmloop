@@ -492,6 +492,8 @@ class TestLaunch(EdgeCase):
             self.assertEqual(self.call("GET", self.O, self.session_headers())[0], 502)
         # an ineligible project keeps only a fixed reason, even if the backend's text is hostile or mistyped
         for reason, want in (("the checkout has uncommitted changes", "the checkout has uncommitted changes"),
+                             ("the one-shot launch was already used", "the one-shot launch was already used"),
+                             ("the one-shot claim could not be checked", "the one-shot claim could not be checked"),
                              ("/home/pierce/secret", "The project is not ready to launch."), ({"a": 1}, None), (["x"], None)):
             p = {"id": "a", "label": "A", "eligible": False, "reason": reason}
             Backend.routes[("GET", self.O)] = (200, "application/json", json.dumps({**OPTIONS, "projects": [p]}).encode(), {})
@@ -583,6 +585,17 @@ class TestLaunch(EdgeCase):
                 self.assertEqual((s, typed(d)), (502, "upstream_error"), route)
         Backend.routes[("POST", self.P)] = (202, "text/html", b'{"id":"a"}', {})
         self.assertEqual(self.post()[0], 502)
+
+    def test_launch_reply_relays_only_fixed_one_shot_reasons(self):
+        def err(reason):
+            return json.dumps({"error": {"kind": "ineligible", "message": reason}}).encode()
+        for reason in ("the one-shot launch was already used", "the one-shot claim could not be checked"):
+            self.assertEqual(gateway.launch_reply(409, err(reason)),
+                             (409, {"error": {"kind": "ineligible", "message": reason}}))
+        # hostile or near-miss text, e.g. a path or a claim file's contents, is never relayed
+        for reason in ("the one-shot claim could not be checked: /tmp/x/v1/one-shot/demo", "/home/pierce/secret"):
+            self.assertEqual(gateway.launch_reply(409, err(reason)),
+                             (409, {"error": {"kind": "ineligible", "message": gateway.LAUNCH_MSG["ineligible"]}}))
 
     def test_launch_wait_is_longer_than_rusts_and_a_dead_backend_is_uncertain(self):
         self.assertGreater(gateway.LAUNCH_TIMEOUT, 10)   # Rust waits 10 s for the run to exist

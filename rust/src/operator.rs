@@ -489,6 +489,22 @@ impl Operator {
         ))
     }
 
+    /// `launch_pilot` with a hook that runs under the engine's checkout guard, before the run
+    /// directory exists (see `serial::start_pilot_guarded`).
+    pub fn launch_pilot_guarded(
+        &self,
+        run_id: &str,
+        policy: serial::Policy,
+        under_guard: impl FnOnce(&serial::Policy) -> Result<()>,
+    ) -> Result<ResumeOutcome> {
+        let id = state::validate_run_id(run_id).map_err(|m| Error::new("usage", m))?;
+        Ok(outcome(
+            id.clone(),
+            serial::start_pilot_guarded(&self.store, &id, policy, under_guard)?,
+            true,
+        ))
+    }
+
     fn dir(&self, run_id: &str) -> Result<(String, PathBuf)> {
         let id = state::validate_run_id(run_id).map_err(|m| Error::new("usage", m))?;
         match self.store.run_dir(&id, false)? {

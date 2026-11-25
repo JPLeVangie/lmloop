@@ -692,10 +692,11 @@ async fn launch(State(c): State<Arc<Ctx>>, body: Bytes) -> Response {
         LAUNCH_VISIBLE,
         tokio::task::spawn_blocking(move || {
             let registry = c2.launch.as_ref().expect("checked");
-            let policy = registry.prepare(&c2.root, &b.project, &b.objective, &b.revision)?;
+            let (policy, shot) =
+                registry.prepare(&c2.root, &b.project, &b.objective, &b.revision)?;
             Ok(std::thread::spawn(move || {
                 let _flag = flag;
-                Operator::new(&c2.root).launch_pilot(&id2, policy)
+                Operator::new(&c2.root).launch_pilot_guarded(&id2, policy, |p| shot.claim(p))
             }))
         }),
     )

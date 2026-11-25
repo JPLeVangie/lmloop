@@ -10,6 +10,7 @@ use crate::state::{self, Error, Result, check_file, io_err};
 use serde_json::{Value, json};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
@@ -150,16 +151,127 @@ pub struct Progress {
     file: File,
     path: PathBuf,
     ident: (u64, u64),
+    /// `Some(writer_gid)` only for the opt-in shared file (see `open_shared`).
+    shared_gid: Option<u32>,
     /// Bytes validated as whole records, and the file length last seen (whole records + tail).
     valid: u64,
     seen_len: u64,
     base: u64,
 }
 
+/// Opt-in shared-file trust: a regular file, exactly 0620, owned by this (backend) uid with the
+/// dedicated writer gid, one link. Group write is not kernel append-only, so this trusts the relay
+/// in that group; the worker must not see the path or belong to the group.
+fn shared_trusted(m: &fs::Metadata, gid: u32) -> bool {
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let euid = unsafe { libc::geteuid() };
+    m.is_file() && m.nlink() == 1 && m.mode() & 0o7777 == 0o620 && m.uid() == euid && m.gid() == gid
+}
+
+/// Walk to the file's parent using directory descriptors, refusing symlinks and ancestry
+/// replacement. The immediate parent must be private; sticky writable ancestors are accepted only
+/// when root-owned (for example /tmp), since sticky prevents other users replacing our private dir.
+fn protected_parent(path: &Path, ident: (u64, u64), gid: u32) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    let Some(name) = path.file_name() else {
+        return false;
+    };
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let euid = unsafe { libc::geteuid() };
+    let root = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open("/")
+    {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    let Ok(root_meta) = root.metadata() else {
+        return false;
+    };
+    if !root_meta.is_dir() || root_meta.uid() != 0 || root_meta.mode() & 0o022 != 0 {
+        return false;
+    }
+    let mut dir = root;
+    let components: Vec<_> = parent
+        .components()
+        .filter_map(|c| match c {
+            std::path::Component::Normal(n) => Some(n),
+            std::path::Component::RootDir => None,
+            _ => Some(std::ffi::OsStr::new("..")),
+        })
+        .collect();
+    for (i, component) in components.iter().enumerate() {
+        let c = match std::ffi::CString::new(component.as_bytes()) {
+            Ok(c) => c,
+            Err(_) => return false,
+        };
+        // SAFETY: dir is an open directory and c is NUL terminated.
+        let fd = unsafe {
+            libc::openat(
+                dir.as_raw_fd(),
+                c.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return false;
+        }
+        // SAFETY: openat returned a fresh owned descriptor.
+        dir = unsafe { File::from_raw_fd(fd) };
+        let Ok(m) = dir.metadata() else { return false };
+        let mode = m.mode();
+        if !m.is_dir() || (m.uid() != euid && m.uid() != 0) {
+            return false;
+        }
+        let immediate = i + 1 == components.len();
+        if immediate {
+            if mode & 0o022 != 0 {
+                return false;
+            }
+        } else if mode & 0o022 != 0 && !(m.uid() == 0 && mode & 0o1000 != 0) {
+            return false;
+        }
+    }
+    let c = match std::ffi::CString::new(name.as_bytes()) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    // SAFETY: dir is the opened parent and c is NUL terminated; no-follow pins the leaf.
+    let fd = unsafe {
+        libc::openat(
+            dir.as_raw_fd(),
+            c.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return false;
+    }
+    // SAFETY: openat returned a fresh owned descriptor.
+    let leaf = unsafe { File::from_raw_fd(fd) };
+    leaf.metadata()
+        .is_ok_and(|m| (m.dev(), m.ino()) == ident && shared_trusted(&m, gid))
+}
+
 impl Progress {
     /// `path` must be absolute, already normal (no symlink in it), outside `repo`, and a regular
     /// file we own with mode 0600 and a single link. The operator creates it beforehand.
     pub fn open(path: &Path, repo: &Path) -> Result<Self> {
+        Self::open_with(path, repo, None)
+    }
+
+    /// Opt-in for a relay under another account: as `open`, but the file must instead be exactly
+    /// 0620, owned by this uid, group `writer_gid`, with only protected ancestors. `poll` rechecks
+    /// all of it, so a chmod, chown, relink or loosened parent fails closed.
+    pub fn open_shared(path: &Path, repo: &Path, writer_gid: u32) -> Result<Self> {
+        Self::open_with(path, repo, Some(writer_gid))
+    }
+
+    fn open_with(path: &Path, repo: &Path, shared_gid: Option<u32>) -> Result<Self> {
         let bad = |m: &str| Error::new("progress_unsafe", format!("{}: {m}", path.display()));
         if !path.is_absolute() || fs::canonicalize(path).map_err(io_err(path))? != path {
             return Err(bad(
@@ -174,15 +286,29 @@ impl Progress {
             .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(path)
             .map_err(io_err(path))?;
-        check_file(&file, path)?;
         let m = file.metadata().map_err(io_err(path))?;
-        if m.nlink() != 1 {
-            return Err(bad("has other hard links"));
+        if let Some(gid) = shared_gid {
+            if !shared_trusted(&m, gid) {
+                return Err(bad(
+                    "shared file must be a regular, single-link 0620 file owned by this uid and the writer gid",
+                ));
+            }
+            if !protected_parent(path, (m.dev(), m.ino()), gid) {
+                return Err(bad(
+                    "shared file's parents must be owned by us or root and not group/other writable",
+                ));
+            }
+        } else {
+            check_file(&file, path)?;
+            if m.nlink() != 1 {
+                return Err(bad("has other hard links"));
+            }
         }
         let mut p = Self {
             file,
             path: path.into(),
             ident: (m.dev(), m.ino()),
+            shared_gid,
             valid: 0,
             seen_len: 0,
             base: 0,
@@ -236,6 +362,11 @@ impl Progress {
         let m = self.file.metadata().map_err(io_err(&self.path))?;
         if m.nlink() != 1 {
             return Err(self.bad("gained a hard link"));
+        }
+        if let Some(gid) = self.shared_gid
+            && (!shared_trusted(&m, gid) || !protected_parent(&self.path, self.ident, gid))
+        {
+            return Err(self.bad("shared file's mode, owner, group or parents changed"));
         }
         if m.len() < self.seen_len {
             return Err(self.bad("was truncated"));
@@ -699,6 +830,95 @@ mod tests {
         mk(&other.join("new"), "model\nmodel\n");
         fs::rename(other.join("new"), &p).unwrap();
         assert!(r.poll().unwrap_err().message.contains("replaced"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn shared_progress_is_opt_in_and_rechecks_trust_at_every_poll() {
+        use std::io::Write;
+        use std::os::unix::fs::{PermissionsExt, chown};
+        let dir = std::env::temp_dir().join(format!("lmloop-shared-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("repo")).unwrap();
+        fs::create_dir_all(dir.join("out")).unwrap();
+        for d in [&dir, &dir.join("repo"), &dir.join("out")] {
+            fs::set_permissions(d, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let (repo, out) = (
+            fs::canonicalize(dir.join("repo")).unwrap(),
+            fs::canonicalize(dir.join("out")).unwrap(),
+        );
+        let p = out.join("p");
+        let gid = fs::metadata(&out).unwrap().gid(); // a group we belong to: no privilege needed
+        let mk = |p: &Path, body: &str, mode: u32| {
+            let _ = fs::remove_file(p);
+            fs::write(p, body).unwrap();
+            chown(p, None, Some(gid)).unwrap();
+            fs::set_permissions(p, fs::Permissions::from_mode(mode)).unwrap();
+        };
+        let kind = |r: Result<Progress>| r.err().map(|e| e.kind);
+
+        // Default stays owner-only: a 0620 file is refused by `open`, a 0600 file by `open_shared`.
+        mk(&p, "model\n", 0o620);
+        assert_eq!(kind(Progress::open(&p, &repo)), Some("unsafe_path"));
+        mk(&p, "model\n", 0o600);
+        assert!(Progress::open(&p, &repo).is_ok());
+        assert_eq!(
+            kind(Progress::open_shared(&p, &repo, gid)),
+            Some("progress_unsafe")
+        );
+
+        // Same checks at open and at poll for the shared file: wrong gid, other modes, extra link.
+        mk(&p, "model\n", 0o620);
+        assert_eq!(
+            kind(Progress::open_shared(&p, &repo, gid.wrapping_add(1))),
+            Some("progress_unsafe")
+        );
+        for mode in [0o660, 0o621, 0o720, 0o2620] {
+            fs::set_permissions(&p, fs::Permissions::from_mode(mode)).unwrap();
+            assert_eq!(
+                kind(Progress::open_shared(&p, &repo, gid)),
+                Some("progress_unsafe"),
+                "{mode:o}"
+            );
+        }
+        mk(&p, "model\n", 0o620);
+        let mut r = Progress::open_shared(&p, &repo, gid).unwrap();
+        assert_eq!((r.baseline(), r.poll().unwrap()), (1, 0));
+        OpenOptions::new()
+            .append(true)
+            .open(&p)
+            .unwrap()
+            .write_all(b"model\n")
+            .unwrap();
+        assert_eq!(r.poll().unwrap(), 1);
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o660)).unwrap();
+        assert!(r.poll().unwrap_err().message.contains("changed"));
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o620)).unwrap();
+        assert_eq!(r.poll().unwrap(), 1); // restoring the exact mode restores trust
+        fs::hard_link(&p, out.join("link")).unwrap();
+        assert!(r.poll().unwrap_err().message.contains("hard link"));
+        fs::remove_file(out.join("link")).unwrap();
+        fs::set_permissions(&out, fs::Permissions::from_mode(0o770)).unwrap(); // group-writable parent
+        assert!(r.poll().unwrap_err().message.contains("parents"));
+        assert_eq!(
+            kind(Progress::open_shared(&p, &repo, gid)),
+            Some("progress_unsafe")
+        );
+        fs::set_permissions(&out, fs::Permissions::from_mode(0o700)).unwrap();
+
+        // A replacement inode, even one with identical metadata and content, is refused.
+        let mut r = Progress::open_shared(&p, &repo, gid).unwrap();
+        mk(&out.join("new"), "model\n", 0o620);
+        fs::rename(out.join("new"), &p).unwrap();
+        assert!(r.poll().unwrap_err().message.contains("replaced"));
+
+        // Outside the checkout still applies.
+        mk(&repo.join("p"), "", 0o620);
+        assert_eq!(
+            kind(Progress::open_shared(&repo.join("p"), &repo, gid)),
+            Some("progress_unsafe")
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 

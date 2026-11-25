@@ -964,6 +964,102 @@ fn wait_phase(a: &str, id: &str, phase: &str) -> Value {
 }
 
 #[test]
+fn shared_watchdog_progress_is_opt_in_and_launch_observes_pulses() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let s = Scratch::new("shared-progress");
+    let (registry, template) = s.registry(&format!(
+        "pulse|src/one.txt|{}",
+        s.0.join("progress").display()
+    ));
+    let progress = s.0.join("progress");
+    fs::write(&progress, b"").unwrap();
+    fs::set_permissions(&progress, fs::Permissions::from_mode(0o620)).unwrap();
+    let gid = fs::metadata(&s.0).unwrap().gid();
+    let configure = |gid: Option<u32>| {
+        s.edit_template(&template, |v| {
+            let mut wd = json!({"progress_file": progress, "startup_secs": 3, "idle_secs": 3});
+            if let Some(gid) = gid {
+                wd["writer_gid"] = json!(gid);
+            }
+            v["worker"]["timeout_secs"] = json!(30);
+            v["worker"]["watchdog"] = wd;
+        });
+    };
+    // Defaults remain owner-only and reject a shared 0620 file.
+    configure(None);
+    let srv = s.serve_launch(&registry);
+    let a = srv.addr.as_str();
+    assert_eq!(demo(a)["eligible"], false);
+    assert!(!s.state().join("v1/one-shot/demo").exists());
+    drop(srv);
+
+    configure(Some(gid.wrapping_add(1)));
+    let srv = s.serve_launch(&registry);
+    assert_eq!(demo(&srv.addr)["eligible"], false);
+    assert!(!s.state().join("v1/one-shot/demo").exists());
+    drop(srv);
+
+    configure(Some(gid));
+    let srv = s.serve_launch(&registry);
+    let a = srv.addr.as_str();
+    let options = demo(a);
+    assert_eq!(options["eligible"], true, "{options}");
+    let r = post(
+        a,
+        "/api/runs",
+        json!({"project":"demo", "objective":"x", "revision":options["revision"]}),
+    );
+    assert_eq!(r.status, 202, "{}", r.body);
+    let id = r.json()["id"].as_str().unwrap().to_string();
+    let view = wait_phase(a, &id, "complete");
+    assert!(
+        view["watchdog"]["model_pulses"].as_u64().unwrap() > 0,
+        "{view}"
+    );
+    assert!(fs::read(&progress).unwrap().starts_with(b"model\n"));
+}
+
+#[test]
+fn stop_now_still_cancels_a_shared_progress_watchdog_run() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let s = Scratch::new("shared-stop-now");
+    let (registry, template) = s.registry(&format!(
+        "pulse1|src/one.txt|{}",
+        s.0.join("progress").display()
+    ));
+    let progress = s.0.join("progress");
+    fs::write(&progress, b"").unwrap();
+    fs::set_permissions(&progress, fs::Permissions::from_mode(0o620)).unwrap();
+    let gid = fs::metadata(&s.0).unwrap().gid();
+    s.edit_template(&template, |v| {
+        v["worker"]["timeout_secs"] = json!(30);
+        v["worker"]["watchdog"] = json!({"progress_file": progress, "writer_gid": gid, "startup_secs": 5, "idle_secs": 10});
+    });
+    let srv = s.serve_launch(&registry);
+    let a = srv.addr.as_str();
+    let options = demo(a);
+    let r = post(
+        a,
+        "/api/runs",
+        json!({"project":"demo", "objective":"x", "revision":options["revision"]}),
+    );
+    assert_eq!(r.status, 202, "{}", r.body);
+    let id = r.json()["id"].as_str().unwrap().to_string();
+    let t = Instant::now();
+    while fs::metadata(&progress).unwrap().len() == 0 {
+        assert!(t.elapsed() < Duration::from_secs(10), "no progress pulse");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let stop = post(
+        a,
+        &format!("/api/runs/{id}/control"),
+        json!({"control":"stop_now"}),
+    );
+    assert_eq!(stop.status, 200, "{}", stop.body);
+    assert_eq!(wait_phase(a, &id, "stopped")["phase"], "stopped");
+}
+
+#[test]
 fn launch_is_off_unless_a_registry_is_given() {
     let s = Scratch::new("launch-off");
     let srv = s.serve();
@@ -1377,6 +1473,249 @@ fn a_launch_on_a_checkout_held_by_another_process_is_busy_and_publishes_nothing(
     drop(held);
     let r = post(a, "/api/runs", body);
     assert_eq!(r.status, 202, "{}", r.body);
+}
+
+const SPENT: &str = "the one-shot launch was already used";
+const UNCHECKED: &str = "the one-shot claim could not be checked";
+
+impl Scratch {
+    /// Opt project `demo` into the one-shot policy (the registry is read at startup only).
+    fn one_shot(&self, registry: &Path) {
+        let mut v: Value = serde_json::from_slice(&fs::read(registry).unwrap()).unwrap();
+        v["projects"][0]["one_shot"] = json!(true);
+        self.private(registry, &v);
+    }
+
+    fn run_count(&self) -> usize {
+        fs::read_dir(self.state().join("v1/runs")).map_or(0, |d| d.count())
+    }
+}
+
+fn launch_demo(a: &str, rev: &str) -> Reply {
+    post(
+        a,
+        "/api/runs",
+        json!({"project": "demo", "objective": "x", "revision": rev}),
+    )
+}
+
+fn assert_spent(a: &str, s: &Scratch, runs: usize, reason: &str) {
+    let p = demo(a);
+    assert_eq!(
+        (p["eligible"].as_bool(), p["reason"].as_str()),
+        (Some(false), Some(reason))
+    );
+    let r = launch_demo(a, p["revision"].as_str().unwrap());
+    assert_eq!(
+        (r.status, r.kind().as_str()),
+        (409, "ineligible"),
+        "{}",
+        r.body
+    );
+    assert_eq!(r.json()["error"]["message"], reason);
+    assert!(
+        !r.body.contains("/tmp") && !r.body.contains("lmloop-web-"),
+        "{}",
+        r.body
+    );
+    assert_eq!(s.run_count(), runs, "a refused launch published a run");
+}
+
+#[test]
+fn a_one_shot_project_spends_only_on_a_valid_launch_and_stays_spent_across_restart() {
+    let s = Scratch::new("one-shot");
+    let (registry, template) = s.registry("ok|src/one.txt|x");
+    let plain = s.serve_launch(&registry);
+    let rev0 = demo(plain.addr.as_str())["revision"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    drop(plain);
+    s.one_shot(&registry);
+    let srv = s.serve_launch(&registry);
+    let a = srv.addr.as_str();
+    let p = demo(a);
+    assert_eq!(p["eligible"], true);
+    let rev = p["revision"].as_str().unwrap().to_string();
+    assert_ne!(
+        rev, rev0,
+        "the one-shot choice is part of the reviewed revision"
+    );
+    assert_eq!(launch_demo(a, &rev0).kind(), "stale_revision");
+
+    // Nothing that is refused before the claim spends the shot.
+    let claims = s.state().join("v1/one-shot");
+    let kinds = |objective: &str, revision: &str| {
+        let r = post(
+            a,
+            "/api/runs",
+            json!({"project": "demo", "objective": objective, "revision": revision}),
+        );
+        (r.status, r.kind())
+    };
+    assert_eq!(kinds("x", "stale"), (409, "stale_revision".into()));
+    assert_eq!(kinds("  ", &rev), (400, "usage".into()));
+    fs::write(s.0.join("repo/README"), "dirty\n").unwrap();
+    assert_eq!(kinds("x", &rev), (409, "ineligible".into()));
+    fs::write(s.0.join("repo/README"), "base\n").unwrap();
+    s.edit_template(&template, |v| v["gate"]["timeout_secs"] = json!(31));
+    assert_eq!(kinds("x", &rev), (409, "stale_revision".into()));
+    s.edit_template(&template, |v| v["gate"]["timeout_secs"] = json!(30));
+    let git_dir = lmloop::git::checkout_dir(&s.0.join("repo"))
+        .unwrap()
+        .unwrap();
+    let held = lmloop::lease::claim_checkout(&git_dir).unwrap().unwrap();
+    assert_eq!(kinds("x", &rev), (409, "busy".into()));
+    drop(held);
+    assert!(!claims.exists(), "a refused launch spent the shot");
+    assert_eq!(s.run_count(), 0);
+    assert_eq!(demo(a)["eligible"], true);
+
+    // A launch that passes everything spends it, once.
+    let r = launch_demo(a, &rev);
+    assert_eq!(r.status, 202, "{}", r.body);
+    let id = r.json()["id"].as_str().unwrap().to_string();
+    wait_phase(a, &id, "complete");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let m = fs::metadata(claims.join("demo")).unwrap();
+        assert_eq!(m.permissions().mode() & 0o777, 0o600);
+    }
+    assert_spent(a, &s, 1, SPENT);
+
+    // A restart on the same state root, and a second process sharing it, see the same claim.
+    drop(srv);
+    let again = s.serve_launch(&registry);
+    assert_spent(again.addr.as_str(), &s, 1, SPENT);
+    let other = s.serve_launch(&registry);
+    assert_spent(other.addr.as_str(), &s, 1, SPENT);
+    assert!(claims.join("demo").exists());
+}
+
+#[test]
+fn two_processes_on_one_state_root_cannot_both_launch_a_one_shot_project() {
+    let s = Scratch::new("one-shot-race");
+    let (registry, _) = s.registry("ok|src/one.txt|x");
+    s.one_shot(&registry);
+    let (x, y) = (s.serve_launch(&registry), s.serve_launch(&registry));
+    let rev = demo(x.addr.as_str())["revision"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let go = |a: String, rev: String| std::thread::spawn(move || launch_demo(&a, &rev).status);
+    let (hx, hy) = (go(x.addr.clone(), rev.clone()), go(y.addr.clone(), rev));
+    let mut got = [hx.join().unwrap(), hy.join().unwrap()];
+    got.sort();
+    assert_eq!(got, [202, 409]);
+    assert_eq!(s.run_count(), 1);
+}
+
+#[test]
+fn a_one_shot_launch_that_fails_before_any_worker_pulse_still_spends_the_shot() {
+    let s = Scratch::new("one-shot-stall");
+    let (registry, template) = s.registry("stall|src/one.txt|x");
+    let progress = s.0.join("progress");
+    s.private_bytes(&progress, b"");
+    s.edit_template(&template, |v| {
+        v["worker"]["watchdog"] =
+            json!({"progress_file": progress, "startup_secs": 1, "idle_secs": 1});
+    });
+    s.one_shot(&registry);
+    let srv = s.serve_launch(&registry);
+    let a = srv.addr.as_str();
+    let r = launch_demo(a, demo(a)["revision"].as_str().unwrap());
+    assert_eq!(r.status, 202, "{}", r.body);
+    let id = r.json()["id"].as_str().unwrap().to_string();
+    wait_phase(a, &id, "failed");
+    assert_eq!(fs::read(&progress).unwrap(), b"", "the worker never pulsed");
+    // The checkout is now dirty as well, but the spent shot is what is reported.
+    let t = Instant::now();
+    while launch_demo(a, "0").kind() == "busy" {
+        assert!(t.elapsed() < Duration::from_secs(10), "slot never freed");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_spent(a, &s, 1, SPENT);
+}
+
+#[test]
+fn an_unreadable_or_malformed_one_shot_claim_refuses_and_is_never_removed_or_rewritten() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    let s = Scratch::new("one-shot-bad");
+    let (registry, _) = s.registry("ok|src/one.txt|x");
+    s.one_shot(&registry);
+    let srv = s.serve_launch(&registry);
+    let a = srv.addr.as_str();
+    let dir = s.state().join("v1/one-shot");
+    fs::create_dir_all(&dir).unwrap();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+    let claim = dir.join("demo");
+
+    for body in [
+        &b"{"[..],
+        b"",
+        b"{\"claim_version\":1,\"project\":\"other\",\"claimed_at_unix\":1}",
+    ] {
+        s.private_bytes(&claim, body);
+        assert_spent(a, &s, 0, UNCHECKED);
+        assert_eq!(fs::read(&claim).unwrap(), body, "a bad claim was rewritten");
+    }
+    fs::remove_file(&claim).unwrap();
+    symlink(s.0.join("repo/README"), &claim).unwrap();
+    assert_spent(a, &s, 0, UNCHECKED);
+    assert!(
+        fs::symlink_metadata(&claim)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    fs::remove_file(&claim).unwrap();
+    // A shared directory is not trusted either, and nothing is created in it.
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+    assert_spent(a, &s, 0, UNCHECKED);
+    assert!(!claim.exists());
+}
+
+#[test]
+fn the_one_shot_claim_is_revalidated_under_the_engines_checkout_guard() {
+    use lmloop::project::Registry;
+    let s = Scratch::new("one-shot-guard");
+    let (registry, _) = s.registry("ok|src/one.txt|x");
+    s.one_shot(&registry);
+    let reg = Registry::load(&registry).unwrap();
+    let root = fs::canonicalize(s.state()).unwrap();
+    let prepare = || {
+        let rev = reg.options(&root)["projects"][0]["revision"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        reg.prepare(&root, "demo", "x", &rev)
+    };
+    let launch = |shot: &lmloop::project::Shot, p: lmloop::serial::Policy| {
+        Operator::new(&root).launch_pilot_guarded("r1", p, |p| shot.claim(p))
+    };
+    let claim = root.join("v1/one-shot/demo");
+    let head = s.git(&["rev-parse", "HEAD"]);
+
+    // The checkout turns dirty after `prepare` passed: refused under the guard, shot unspent.
+    let (policy, shot) = prepare().unwrap();
+    fs::write(s.0.join("repo/README"), "dirty\n").unwrap();
+    let e = launch(&shot, policy).expect_err("launched a dirty checkout");
+    assert_eq!(
+        (e.kind, e.message.as_str()),
+        ("ineligible", "the checkout has uncommitted changes")
+    );
+    assert!(!claim.exists() && !root.join("v1/runs/r1").exists());
+    fs::write(s.0.join("repo/README"), "base\n").unwrap();
+
+    // Another process spends the shot after `prepare` passed: refused under the guard.
+    let (policy, shot) = prepare().unwrap();
+    let (other_policy, other) = prepare().unwrap();
+    other.claim(&other_policy).unwrap();
+    let e = launch(&shot, policy).expect_err("spent shot launched");
+    assert_eq!((e.kind, e.message.as_str()), ("ineligible", SPENT));
+    assert!(!root.join("v1/runs/r1").exists());
+    assert_eq!(s.git(&["rev-parse", "HEAD"]), head);
+    assert!(claim.exists());
 }
 
 #[test]

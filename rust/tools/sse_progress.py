@@ -10,6 +10,7 @@ over the size caps. The decoder only observes bytes; it never alters, delays or 
 Progress file contract (checked at open; ValueError otherwise): created ahead of time by the
 trusted side, regular file, not a symlink, mode 0600 (no group/other bits), owned by this user,
 link count 1. Keep it outside the model's reach; this module cannot check that.
+Opt-in shared mode (--owner-uid/--writer-gid, see ProgressSink) is for a relay under another account.
 
 Hookup, no edit to bridge.py (the wrapper below patches http.client in the bridge process and
 then runs the bridge's own main(), so argv, endpoint, credential handling and byte forwarding are
@@ -22,7 +23,7 @@ Hookup as a library, if bridge.py is ever edited: build one `ProgressSink(path)`
 per upstream response `d = SseDecoder(sink)` and call `d.feed(chunk)` on each chunk read1()
 returns, before `self.wfile.write(chunk)`. feed() never raises.
 """
-import argparse, json, os, re, runpy, stat, sys, threading, time
+import argparse, fcntl, json, os, re, runpy, stat, sys, threading, time
 
 MAX_LINE = 1 << 18   # one SSE line; longer lines are skipped whole
 MAX_EVENT = 1 << 20  # joined data of one event; larger events are skipped whole
@@ -31,16 +32,52 @@ _EOL = re.compile(rb"\r\n|\r|\n")
 
 
 class ProgressSink:
-    def __init__(self, path, clock=time.monotonic):
+    """`shared=(owner_uid, writer_gid)` opts in to the relay-account mode, where the backend owns the
+    file and this writer reaches it through the group: exactly 0620, those ids, one link, an exclusive
+    flock held for our lifetime, and the path must still name our inode and pass the same checks
+    before every write, else the sink retires for good. Group write is not kernel append-only: the
+    relay is trusted, and the worker must not see the path or belong to the group."""
+
+    def __init__(self, path, clock=time.monotonic, shared=None):
         fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
+        self.path, self.shared = path, shared
         try:
             st = os.fstat(fd)
-            if not stat.S_ISREG(st.st_mode) or st.st_mode & 0o177 or st.st_nlink != 1 or st.st_uid != os.geteuid():
-                raise ValueError("progress file must be a private 0600 regular file, owned by us, one link")
+            if not self._trusted(st):
+                raise ValueError("progress file must be a private 0600 regular file, owned by us, one link"
+                                 if shared is None else
+                                 "shared progress file must be a regular 0620 file with the expected owner and gid, one link")
+            if shared is not None:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    raise ValueError("another writer holds the progress file") from None
         except BaseException:
             os.close(fd)
             raise
+        self.ident = (st.st_dev, st.st_ino)
         self.fd, self.clock, self.last, self.lock = fd, clock, None, threading.Lock()
+
+    def _trusted(self, st):
+        if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
+            return False
+        if self.shared is None:
+            return not st.st_mode & 0o177 and st.st_uid == os.geteuid()
+        return stat.S_IMODE(st.st_mode) == 0o620 and (st.st_uid, st.st_gid) == tuple(self.shared)
+
+    def _still_ours(self):
+        try:
+            disk, st = os.stat(self.path, follow_symlinks=False), os.fstat(self.fd)
+        except OSError:
+            return False
+        return (disk.st_dev, disk.st_ino) == self.ident == (st.st_dev, st.st_ino) and self._trusted(st)
+
+    def _retire(self):
+        try:
+            os.close(self.fd)  # also drops the flock
+        except OSError:
+            pass
+        self.fd = None
 
     def tick(self):
         with self.lock:
@@ -48,14 +85,12 @@ class ProgressSink:
             if self.fd is None or (self.last is not None and now - self.last < INTERVAL):
                 return
             self.last = now
+            if self.shared is not None and not self._still_ours():
+                return self._retire()
             try:
                 os.write(self.fd, b"model\n")
             except OSError:  # progress is best-effort; never disturb the relay
-                try:
-                    os.close(self.fd)
-                except OSError:
-                    pass
-                self.fd = None
+                self._retire()
 
 
 def _semantic(obj):
@@ -163,9 +198,14 @@ def main(argv=None):
     a = argparse.ArgumentParser(description="run bridge.py with a count-only SSE progress beacon")
     a.add_argument("--progress-file", required=True)
     a.add_argument("--bridge", required=True)
+    a.add_argument("--owner-uid", type=int, help="opt in to the shared 0620 file: its owning (backend) uid")
+    a.add_argument("--writer-gid", type=int, help="opt in to the shared 0620 file: its dedicated writer gid")
     a.add_argument("rest", nargs=argparse.REMAINDER, help="-- then the bridge's own arguments")
     o = a.parse_args(argv)
-    wrap_bridge(ProgressSink(o.progress_file))
+    if (o.owner_uid is None) != (o.writer_gid is None):
+        a.error("--owner-uid and --writer-gid go together")
+    shared = None if o.owner_uid is None else (o.owner_uid, o.writer_gid)
+    wrap_bridge(ProgressSink(o.progress_file, shared=shared))
     sys.argv = [o.bridge] + [x for i, x in enumerate(o.rest) if not (i == 0 and x == "--")]
     runpy.run_path(o.bridge, run_name="__main__")
 

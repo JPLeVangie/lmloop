@@ -100,6 +100,9 @@ pub struct Cmd {
 #[serde(deny_unknown_fields)]
 pub struct Watchdog {
     pub progress_file: PathBuf,
+    /// Opt-in group for a relay account writing the shared 0620 progress file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub writer_gid: Option<u32>,
     /// Allowed from worker start to the first model record.
     pub startup_secs: u64,
     /// Allowed between model records after the first.
@@ -772,7 +775,10 @@ impl<'a> Dog<'a> {
         cfg: &Watchdog,
         first_task: bool,
     ) -> Result<Self> {
-        let progress = Progress::open(&cfg.progress_file, repo)?;
+        let progress = match cfg.writer_gid {
+            Some(gid) => Progress::open_shared(&cfg.progress_file, repo, gid)?,
+            None => Progress::open(&cfg.progress_file, repo)?,
+        };
         if first_task && !progress.was_empty_at_open() {
             return Err(Error::new(
                 "progress_unsafe",
@@ -1172,13 +1178,24 @@ fn journal(
 }
 
 pub fn start(store: &Store, run_id: &str, policy: Policy) -> Result<Finish> {
-    begin(store, run_id, policy, false)
+    begin(store, run_id, policy, false, |_| Ok(()))
 }
 
 /// One-shot native pilot of 1-3 serial tasks (a fresh worker session each, first failure stops
 /// the run): same engine and gate; persisted as `pilot`, never resumable.
 pub fn start_pilot(store: &Store, run_id: &str, policy: Policy) -> Result<Finish> {
-    begin(store, run_id, policy, true)
+    begin(store, run_id, policy, true, |_| Ok(()))
+}
+
+/// `start_pilot` with one hook, run once the checkout guard is held and before the run directory
+/// exists. An `Err` ends the launch with nothing published; the guard is held until the run ends.
+pub fn start_pilot_guarded(
+    store: &Store,
+    run_id: &str,
+    policy: Policy,
+    under_guard: impl FnOnce(&Policy) -> Result<()>,
+) -> Result<Finish> {
+    begin(store, run_id, policy, true, under_guard)
 }
 
 /// The checkout guard for `repo`, or `Err(())` when another process holds it. A lookup failure
@@ -1191,11 +1208,18 @@ fn checkout(repo: &Path) -> Result<std::result::Result<Option<lease::Lease>, ()>
     Ok(lease::claim_checkout(&git_dir)?.map(Some).ok_or(()))
 }
 
-fn begin(store: &Store, run_id: &str, policy: Policy, pilot: bool) -> Result<Finish> {
+fn begin(
+    store: &Store,
+    run_id: &str,
+    policy: Policy,
+    pilot: bool,
+    under_guard: impl FnOnce(&Policy) -> Result<()>,
+) -> Result<Finish> {
     // First, so a busy checkout leaves no run directory behind. Held until `drive` returns.
     let Ok(_checkout) = checkout(&policy.repo)? else {
         return Ok(Finish::CheckoutBusy);
     };
+    under_guard(&policy)?;
     let dir = store.run_dir(run_id, true)?.expect("created");
     let Ok(_lease) = claim(&dir, if pilot { "pilot-run" } else { "fixture-run" })? else {
         return Ok(Finish::OwnedElsewhere);

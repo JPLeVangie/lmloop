@@ -172,6 +172,116 @@ class Sink(Base):
         self.assertIsNone(self.sink.fd)
 
 
+class Shared(unittest.TestCase):
+    """Opt-in relay-account mode. Same uid here, so the owner/gid are ours; no privilege needed."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="sse_progress.")
+        self.path = os.path.join(self.temp.name, "progress")
+        self.ids = (os.geteuid(), os.getegid())
+        self.clock, self.sinks = Clock(), []
+        self.make(0o620)
+
+    def tearDown(self):
+        for s in self.sinks:
+            if s.fd is not None:
+                os.close(s.fd)
+        self.temp.cleanup()
+
+    def make(self, mode, path=None):
+        path = path or self.path
+        if os.path.lexists(path):
+            os.unlink(path)
+        os.close(os.open(path, os.O_CREAT | os.O_WRONLY, 0o600))
+        os.chmod(path, mode)
+
+    def sink(self, ids=None, path=None):
+        s = sp.ProgressSink(path or self.path, self.clock, shared=ids or self.ids)
+        self.sinks.append(s)
+        return s
+
+    def written(self):
+        with open(self.path, "rb") as f:
+            return f.read()
+
+    def test_default_stays_owner_only(self):
+        with self.assertRaises(ValueError):
+            sp.ProgressSink(self.path)  # 0620 is refused without the opt-in
+        self.make(0o600)
+        with self.assertRaises(ValueError):
+            self.sink()  # and 0600 is refused with it
+
+    def test_same_checks_at_open_and_at_every_tick(self):
+        s = self.sink()
+        s.tick()
+        self.assertEqual(self.written(), b"model\n")
+        os.chmod(self.path, 0o660)  # loosened after open: the next write retires the sink
+        self.clock.t += 2
+        s.tick()
+        self.assertIsNone(s.fd)
+        self.assertEqual(self.written(), b"model\n")
+        for mode in (0o660, 0o621, 0o720, 0o2620):  # the same metadata is refused at open
+            self.make(mode)
+            with self.assertRaises(ValueError, msg=oct(mode)):
+                self.sink()
+        self.make(0o620)
+        with self.assertRaises(ValueError):
+            self.sink((self.ids[0], self.ids[1] + 1))
+        with self.assertRaises(ValueError):
+            self.sink((self.ids[0] + 1, self.ids[1]))
+
+    def test_rejects_unsafe_file_kinds(self):
+        link, other = os.path.join(self.temp.name, "link"), os.path.join(self.temp.name, "other")
+        os.symlink(self.path, link)
+        with self.assertRaises(OSError):
+            self.sink(path=link)
+        os.mkdir(other, 0o700)
+        os.chmod(other, 0o620)
+        with self.assertRaises((ValueError, OSError)):
+            self.sink(path=other)
+
+    def test_hard_link_refused_at_open_and_retires_a_live_sink(self):
+        s = self.sink()
+        os.link(self.path, os.path.join(self.temp.name, "alias"))
+        s.tick()
+        self.assertIsNone(s.fd)
+        self.assertEqual(self.written(), b"")
+        with self.assertRaises(ValueError):
+            self.sink()
+
+    def test_replacement_or_deletion_retires_the_stale_inode(self):
+        s = self.sink()
+        self.make(0o620, os.path.join(self.temp.name, "new"))
+        os.rename(os.path.join(self.temp.name, "new"), self.path)  # identical metadata, new inode
+        s.tick()
+        self.assertIsNone(s.fd)
+        self.assertEqual(self.written(), b"")
+        s2 = self.sink()
+        os.unlink(self.path)
+        s2.tick()
+        self.assertIsNone(s2.fd)
+
+    def test_concurrent_sink_is_refused_and_lock_is_released_on_retire(self):
+        a = self.sink()
+        with self.assertRaises(ValueError):
+            self.sink()  # second writer on the same inode
+        a._retire()
+        self.sink().tick()  # a retired writer no longer blocks its successor
+        self.assertEqual(self.written(), b"model\n")
+
+    def test_cli_rejects_wrong_expected_owner_before_running_bridge(self):
+        from unittest.mock import patch
+        with patch.object(sp.runpy, "run_path") as run_path:
+            with self.assertRaises(ValueError):
+                sp.main(["--progress-file", self.path, "--bridge", "x",
+                         "--owner-uid", str(self.ids[0] + 1), "--writer-gid", str(self.ids[1])])
+            run_path.assert_not_called()
+
+    def test_cli_requires_both_ids(self):
+        with self.assertRaises(SystemExit):
+            sp.main(["--progress-file", self.path, "--bridge", "x", "--owner-uid", "1"])
+
+
 class Stub(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 

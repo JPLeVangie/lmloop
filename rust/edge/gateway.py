@@ -126,7 +126,8 @@ LAUNCH_STATUSES = (202, 400, 404, 409, 504)
 REASONS = frozenset({"the project template is not usable", "the checkout has uncommitted changes",
                      "the checkout is not on a branch", "a Git operation is in progress in the checkout",
                      "the checkout hides changes (assume-unchanged or skip-worktree)", "the checkout is not ready",
-                     "the worker progress file is not fresh or usable"})
+                     "the worker progress file is not fresh or usable", "the one-shot launch was already used",
+                     "the one-shot claim could not be checked"})
 # Every launch error body is {"error":{"kind","message"}} with THESE messages: backend text is never relayed
 # (except an `ineligible` reason found in REASONS).  Kinds below the first group are the only backend refusals relayed.
 LAUNCH_MSG = {

@@ -81,6 +81,7 @@ run](../README.md#native-pilot-run), [Basic TUI](../README.md#basic-tui),
 - Each manifest carries a reviewed repository-relative scope and caps. See [Worker watchdog](../README.md#worker-watchdog-opt-in) for the caps.
 - Template scopes are checked with `git::check_scope`. An invalid scope makes the template unusable ("the project template is not usable"). So does a template with no room for a 4096-byte objective.
 - The watchdog progress file must be zero-byte at preflight and again at launch, on both options. An absent, partial or used file makes the run ineligible ("the worker progress file is not fresh or usable"). `Dog::start` applies the same zero-byte check.
+- Optional `watchdog.writer_gid` selects the trusted progress-file writer group. For the backend CLI, pass `--owner-uid` and `--writer-gid` together to enable the identity handoff. The progress file must be a fresh, single-link file with exact mode `0620`, owned by the backend UID, under a protected parent outside the checkout. Only the dedicated relay is trusted to write it; do not give the backend a worker path or relay credentials. Without the pair, legacy mode is unchanged. Separate backend and relay identities have not yet been runtime-proven; no unit or account changes were made, and launch is not enabled.
 
 **Behaviour**
 
@@ -93,6 +94,18 @@ run](../README.md#native-pilot-run), [Basic TUI](../README.md#basic-tui),
 - The lock file is never unlinked or truncated, and a symlinked or hard-linked one is refused.
 - **Limit.** The lock is advisory and dies with the process that holds it. It does not protect against a worker orphaned after its launcher dies, or against arbitrary Git writers that never take it. No NFS or other network filesystem was verified.
 - The worker edits the approved checkout in place. The review screen says so and labels the field "Policy revision".
+
+**One-shot projects (optional).** A registry entry may add `"one_shot": true`. Without it, nothing changes: opt-in stays the default and existing entries and revisions are untouched. The registry is read at startup, so changing the flag needs a restart. The flag is part of the reviewed "Policy revision", so a page reviewed before the change gets `stale_revision`.
+
+- **Scope.** The claim is the file `v1/one-shot/<project id>` under the private state root (mode `0600`, in a private directory). It is keyed to that state root and project ID. It applies only to browser launch through the backend API (`POST /api/runs`). The CLI and TUI launch paths, other project IDs and other state roots do not consult it.
+- **Timing.** Checks for objective, revision and eligibility run first, and none of them spends the claim. The claim is then rechecked and taken under the engine's checkout guard, before the run is published and before a worker starts. The guard stays held through the run. The file, its directory, `v1` and the state root are fsynced before the launch continues.
+- **Fixed `409` outcomes.** All are typed, with fixed text and no paths. The edge relays a reason only if it is on its fixed allowlist; anything else, such as a path or claim contents, becomes the generic "The project is not ready to launch."
+  - `ineligible`, "the one-shot launch was already used": the claim exists. Review shows the same reason and the project is not eligible.
+  - `ineligible`, "the one-shot claim could not be checked": the claim file or its directory is unreadable, malformed, for another project, a symlink, or in a shared (non-private) directory. Nothing is created, removed or rewritten.
+  - `ineligible` with a checkout reason, or `busy` ("another run holds this checkout; nothing was started"): refused under the guard, no run directory and no claim.
+- **What keeps the claim.** Once taken, it is never removed by code. A run that fails, never produces a worker pulse, is stopped with STOP-NOW, or ends with an ambiguous outcome still holds it. A `504` (`launch_pending`) is ambiguous: the launch may still take the claim and create a run after the reply, so treat the claim as possibly held. Two processes sharing one state root cannot both launch: one gets `202`, the other `409`.
+- **Operator duty.** A spent or unverifiable claim is not cleared automatically and nothing here recommends clearing it. Before any deliberate offline re-arm, look at the Runs list, the processes and the run evidence (events, checkout, progress file) to learn what the earlier launch did. Keep the old claim and that evidence rather than discarding either.
+- **Limit.** Durability rests on fsync. Power loss was not simulated.
 
 **Production gate.** All of these must hold before this runs in a live unit, and Pierce must approve it:
 
@@ -108,5 +121,6 @@ run](../README.md#native-pilot-run), [Basic TUI](../README.md#basic-tui),
 - Fresh Chromium rerun against the rebuilt binary, at 390x844 and 1440x900: one POST returning 202 each, no POST before acknowledgement, no overflow or page errors, run detail "1 of 1 committed". Scratch commits `695fa4e` (tree `86952012`) and `4a230148` (tree `63845ff1`) each match `snapshot_captured` and the `commit_intent` tree with the gate passed. Only `notes/objective.txt` changed. The scratch repo is clean and all QA listeners are down.
 - Live stays login-only, a release without this feature, and healthy.
 - Checkout exclusion, parent-verified separately: `cargo fmt --check`, 54 serial tests and 17 web tests. No production change.
+- One-shot claim, parent-verified: five one-shot web tests, one serial hook test and 42 gateway tests. Independent security review cleared the earlier lock and durability blockers. Power loss was not simulated. Scratch only; live remains disabled.
 
-**Still open.** An exclusive checkout (the advisory lock does not cover orphaned workers, arbitrary Git writers or NFS), a pinned isolated launcher and relay, per-run watchdog provisioning, policy approval and rollout, a real device, and hosted CI.
+**Still open.** An exclusive checkout (the advisory lock does not cover orphaned workers, arbitrary Git writers or NFS), a pinned isolated launcher and relay, per-run watchdog provisioning, the watchdog handoff, a failed authenticated model smoke, policy approval and rollout, a real device, and hosted CI.
