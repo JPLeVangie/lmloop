@@ -22,9 +22,11 @@
 
 use crate::state::{Error, Result, io_err};
 use std::collections::BTreeMap;
+use std::ffi::CString;
 use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{Read, Write};
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -78,6 +80,148 @@ pub struct Snapshot {
     pub changed: Vec<String>,
     /// Directory holding exactly `tree`'s files; run the gate here.
     pub export: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+pub struct WorktreeCreated {
+    pub path: PathBuf,
+    pub branch: String,
+    pub base_ref: String,
+    pub base_head: String,
+}
+
+/// Validate a private (owner-only 0700, non-symlink) destination root and a clean, attached base checkout.
+pub fn precheck_worktree(
+    base_repo: &Path,
+    worktree_root: &Path,
+    run_id: &str,
+    branch_prefix: &str,
+) -> Result<(PathBuf, String)> {
+    let base = Repo::open(base_repo)?;
+    if !crate::state::private_dir(worktree_root)? {
+        return Err(err(
+            "worktree",
+            "worktree root must be an existing private (0700) directory",
+        ));
+    }
+    let root = fs::canonicalize(worktree_root).map_err(io_err(worktree_root))?;
+    if !crate::state::private_dir(&root)?
+        || root.starts_with(&base.root)
+        || base.root.starts_with(&root)
+    {
+        return Err(err(
+            "worktree",
+            "worktree root must be a private directory outside the base checkout",
+        ));
+    }
+    let dest = root.join(run_id);
+    match fs::symlink_metadata(&dest) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return Err(err("worktree", "worktree destination already exists")),
+        Ok(_) => return Err(err("worktree", "worktree destination already exists")),
+    }
+    let branch = format!("{branch_prefix}/{run_id}");
+    let check = run(
+        &base.root,
+        None,
+        &[
+            "show-ref",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{branch}"),
+        ],
+        None,
+    )?;
+    if check.status.success() {
+        return Err(err("worktree", "worktree branch already exists"));
+    }
+    Ok((root, branch))
+}
+
+/// Create a linked worktree under a pinned private (0700) directory fd via atomic `mkdirat`.
+pub fn create_worktree(
+    base_repo: &Path,
+    worktree_root: &Path,
+    run_id: &str,
+    branch_prefix: &str,
+) -> Result<WorktreeCreated> {
+    let (root, branch) = precheck_worktree(base_repo, worktree_root, run_id, branch_prefix)?;
+    if root != worktree_root {
+        return Err(err("worktree", "worktree root changed during validation"));
+    }
+    // Pin the validated private root directory by fd so its (dev, ino) cannot silently swap.
+    let root_fd = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(&root)
+        .map_err(io_err(&root))?;
+    let rmeta = root_fd.metadata().map_err(io_err(&root))?;
+    // SAFETY: geteuid has no preconditions.
+    let euid = unsafe { libc::geteuid() };
+    if !rmeta.is_dir() || rmeta.uid() != euid || rmeta.mode() & 0o077 != 0 {
+        return Err(err(
+            "worktree",
+            "worktree root is not a private 0700 directory owned by this user",
+        ));
+    }
+    let (rdev, rino) = (rmeta.dev(), rmeta.ino());
+    let base = Repo::open(base_repo)?;
+    let dest = root.join(run_id);
+    let dest_str = dest
+        .to_str()
+        .ok_or_else(|| err("worktree", "destination is not UTF-8"))?;
+    let c_name = CString::new(run_id).map_err(|_| err("worktree", "run_id contains NUL byte"))?;
+    // Atomically create the private 0700 worktree directory inside the pinned root_fd.
+    // SAFETY: root_fd is a valid open directory fd and c_name is a NUL-terminated path component.
+    if unsafe { libc::mkdirat(root_fd.as_raw_fd(), c_name.as_ptr(), 0o700) } != 0 {
+        let e = std::io::Error::last_os_error();
+        return Err(err("worktree", format!("create worktree dir: {e}")));
+    }
+    let dmeta = match fs::symlink_metadata(&dest) {
+        Ok(m) => m,
+        Err(e) => {
+            // SAFETY: remove only the empty dir we just created inside root_fd.
+            unsafe { libc::unlinkat(root_fd.as_raw_fd(), c_name.as_ptr(), libc::AT_REMOVEDIR) };
+            return Err(io_err(&dest)(e));
+        }
+    };
+    let (ddev, dino) = (dmeta.dev(), dmeta.ino());
+    let args = [
+        "worktree",
+        "add",
+        "-b",
+        branch.as_str(),
+        "--",
+        dest_str,
+        base.head.as_str(),
+    ];
+    if let Err(e) = ok(&base.root, None, &args, None) {
+        // SAFETY: remove only the empty dir we created if git worktree add failed.
+        unsafe { libc::unlinkat(root_fd.as_raw_fd(), c_name.as_ptr(), libc::AT_REMOVEDIR) };
+        return Err(e);
+    }
+    let rmeta_after = fs::symlink_metadata(&root).map_err(io_err(&root))?;
+    let dmeta_after = fs::symlink_metadata(&dest).map_err(io_err(&dest))?;
+    let path = fs::canonicalize(&dest).map_err(io_err(&dest))?;
+    if (rmeta_after.dev(), rmeta_after.ino()) != (rdev, rino)
+        || (dmeta_after.dev(), dmeta_after.ino()) != (ddev, dino)
+        || path != dest
+        || !path.starts_with(&root)
+        || path.starts_with(&base.root)
+        || base.root.starts_with(&path)
+    {
+        return Err(err(
+            "worktree",
+            "created worktree resolved outside its pinned root",
+        ));
+    }
+    Repo::open(&path)?;
+    Ok(WorktreeCreated {
+        path,
+        branch,
+        base_ref: base.ref_name,
+        base_head: base.head,
+    })
 }
 
 fn err(kind: &'static str, message: impl Into<String>) -> Error {

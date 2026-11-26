@@ -1215,11 +1215,23 @@ fn options_show_project_scopes_and_budget_but_no_argv_paths_or_prompt() {
     assert_eq!(p["eligible"], false);
     assert!(p["reason"].as_str().unwrap().contains("uncommitted"));
 
-    // Two tasks make the project unusable, not launchable.
+    // Two tasks are eligible with combined deduplicated scopes and budget.tasks == 2; >16 tasks is unusable.
+    fs::write(s.0.join("repo/README"), "base\n").unwrap();
     v["tasks"] = json!([
         { "id": "t1", "prompt": "ok|src/one.txt|x", "scopes": ["src/one.txt"] },
-        { "id": "t2", "prompt": "ok|src/two.txt|x", "scopes": ["src/two.txt"] },
+        { "id": "t2", "prompt": "ok|src/two.txt|x", "scopes": ["src/two.txt", "src/one.txt"] },
     ]);
+    s.private(&template, &v);
+    let p = demo(a);
+    assert_eq!(p["eligible"], true);
+    assert_eq!(p["budget"]["tasks"], 2);
+    assert_eq!(p["scopes"], json!(["src/one.txt", "src/two.txt"]));
+    assert_eq!(p["worktree"], false);
+
+    let too_many: Vec<Value> = (1..=17)
+        .map(|i| json!({ "id": format!("t{i}"), "prompt": format!("ok|src/f{i}.txt|x"), "scopes": [format!("src/f{i}.txt")] }))
+        .collect();
+    v["tasks"] = json!(too_many);
     s.private(&template, &v);
     assert_eq!(demo(a)["eligible"], false);
     assert!(demo(a).get("scopes").is_none());
@@ -1746,4 +1758,82 @@ fn a_resume_on_a_held_checkout_is_a_typed_409_busy_that_leaves_run_state_alone()
     drop(held);
     let r = post(a, "/api/runs/r1/resume", json!({}));
     assert_eq!(r.status, 200, "{}", r.body);
+}
+
+#[test]
+fn web_launch_multi_task_isolated_worktree_end_to_end() {
+    let s = Scratch::new("launch-multi-wt");
+    let (registry, template) = s.registry("ok|src/one.txt|from-template");
+    let wt_root = s.0.join("worktrees");
+    fs::create_dir_all(&wt_root).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&wt_root, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let prog = s.0.join("progress.log");
+    fs::write(&prog, "").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&prog, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let mut v: Value = serde_json::from_slice(&fs::read(&template).unwrap()).unwrap();
+    v["worktree"] = json!({ "root": wt_root, "branch_prefix": "webwt" });
+    v["worker"].as_object_mut().unwrap().remove("timeout_secs");
+    v["worker"]["watchdog"] = json!({ "startup_secs": 4, "idle_secs": 2, "progress_file": prog });
+    v["tasks"] = json!([
+        { "id": "t1", "prompt": format!("pulse|src/one.txt|{}", prog.display()), "scopes": ["src/one.txt"] },
+        { "id": "t2", "prompt": format!("pulse|docs/two.txt|{}", prog.display()), "scopes": ["docs/two.txt"] },
+    ]);
+    s.private(&template, &v);
+
+    let base_head = s.git(&["rev-parse", "HEAD"]);
+    let srv = s.serve_launch(&registry);
+    let a = srv.addr.as_str();
+    let opts = get(a, "/api/launch-options");
+    assert_eq!(opts.status, 200);
+    assert!(
+        !opts.body.contains("worktrees"),
+        "worktree root path leaked: {}",
+        opts.body
+    );
+    let p = &opts.json()["projects"][0];
+    assert_eq!(p["eligible"], true);
+    assert_eq!(p["worktree"], true);
+    assert_eq!(p["budget"]["tasks"], 2);
+    assert!(p["budget"]["worker_timeout_secs"].is_null());
+    assert_eq!(p["scopes"], json!(["src/one.txt", "docs/two.txt"]));
+
+    let rev = p["revision"].as_str().unwrap().to_string();
+    let r = post(
+        a,
+        "/api/runs",
+        json!({"project": "demo", "objective": "build both parts", "revision": rev}),
+    );
+    assert_eq!(r.status, 202, "{}", r.body);
+    let id = r.json()["id"].as_str().unwrap().to_string();
+    let detail = wait_phase(a, &id, "complete");
+    assert_eq!(detail["complete"], true);
+    assert_eq!(detail["branch"], format!("webwt/{id}"));
+    assert_eq!(detail["tasks"].as_array().unwrap().len(), 2);
+    assert_eq!(detail["tasks"][0]["changed"], json!(["src/one.txt"]));
+    assert_eq!(detail["tasks"][1]["changed"], json!(["docs/two.txt"]));
+    // Base checkout untouched; isolated worktree has both files.
+    assert_eq!(s.git(&["rev-parse", "HEAD"]), base_head);
+    assert!(!s.0.join("repo/src/one.txt").exists());
+    assert!(wt_root.join(&id).join("src/one.txt").exists());
+    assert!(wt_root.join(&id).join("docs/two.txt").exists());
+    // Objective was appended to both tasks in persisted policy.
+    let st: Value = serde_json::from_slice(
+        &fs::read(s.state().join(format!("v1/runs/{id}/run.json"))).unwrap(),
+    )
+    .unwrap();
+    for i in [0, 1] {
+        let prompt = st["policy"]["tasks"][i]["prompt"].as_str().unwrap();
+        assert!(
+            prompt.ends_with("build both parts"),
+            "task {i} missing objective: {prompt}"
+        );
+    }
 }

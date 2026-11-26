@@ -495,7 +495,8 @@ function renderTasks(v) {
       id.append(pip, document.createTextNode(t.id));
       const sb = badge(words(t.state), t.state === "committed" ? "ok" : t.state === "running" ? "live" : t.state === "failed" ? "bad" : "neutral");
       const sub = el("span", "task-sub");
-      sub.append(el("span", null, t.commit ? `commit ${t.commit.slice(0, 12)}` : "no commit"));
+      const files = Array.isArray(t.changed) && t.changed.length ? ` · ${t.changed.length} file${t.changed.length === 1 ? "" : "s"}` : "";
+      sub.append(el("span", null, t.commit ? `commit ${t.commit.slice(0, 12)}${files}` : "no commit"));
       if (t.gate_log) {
         const b = el("button", "linkbtn", "Open gate log");
         b.type = "button";
@@ -542,6 +543,7 @@ function renderFacts(v) {
     ["Objective", v.objective ? String(v.objective) : "Not exposed by the operator API in this milestone.", !v.objective],
     ["Phase", words(v.phase)],
     ["Kind", KIND[v.kind] || words(v.kind)],
+    ...(v.branch ? [["Worktree branch", v.branch]] : []),
     ["Lease", leaseText(v.lease) + (v.lease && v.lease.command ? ` · ${v.lease.command}` : "") + (v.lease && v.lease.started_at_unix ? ` · since ${stamp(v.lease.started_at_unix)}` : "")],
     ["Evidence", words(v.evidence)],
     ["Complete", v.complete ? "Yes: every task committed" : "No"],
@@ -866,11 +868,14 @@ function normalizeOptions(raw) {
     const scopes = Array.isArray(p.scopes) ? p.scopes : [];
     const limits = { total: secs(b.worker_timeout_secs), startup: secs(b.worker_startup_secs), idle: secs(b.worker_idle_secs), gate: secs(b.gate_timeout_secs) };
     const revision = typeof p.revision === "string" ? p.revision : "";
+    const tasks = Number.isInteger(b.tasks) ? b.tasks : 0;
+    const worktree = p.worktree === true;
     // Unset limits are shown as unset, not rejected: the server is the authority. Only a
     // malformed value, or a worker with neither a total nor a watchdog, is not reviewable.
     const ok =
       revision &&
-      b.tasks === 1 &&
+      tasks >= 1 &&
+      tasks <= 16 &&
       scopes.length > 0 &&
       scopes.every((s) => typeof s === "string" && s.length > 0) &&
       limits.gate !== null && // the engine always runs a hard gate limit, so a missing one is not reviewable
@@ -878,7 +883,7 @@ function normalizeOptions(raw) {
       (limits.startup === null) === (limits.idle === null) &&
       (limits.total !== null || limits.startup !== null);
     if (!ok) out.unavailable.push({ id, label, reason: INCOMPLETE });
-    else out.options.push({ id, label, scopes, limits, revision });
+    else out.options.push({ id, label, scopes, limits, revision, tasks, worktree });
   }
   return out;
 }
@@ -931,11 +936,15 @@ const workerLimits = (o) => `worker total ${secsLabel(o.limits.total)}, startup 
 
 function launchRows(o, objective) {
   const l = o.limits;
+  const taskWord = o.tasks === 1 ? "1 task" : `${o.tasks} serial tasks (fresh worker session each, with committed-task handoff)`;
+  const checkoutMode = o.worktree
+    ? "The run executes in a fresh isolated Git worktree branch; the base checkout is not modified, and the worktree is kept on failure or stop."
+    : "The worker makes changes in the approved checkout in place; edits from a failed or stopped run are kept, not rolled back.";
   return [
     ["Policy", o.label],
-    ["Allowed commit scope", `${scopeText(o.scopes, "\n")}\nExact paths the task may commit, quoted so spaces show. This is not a filesystem sandbox.`],
-    ["Tasks", "1 task. Your objective is appended to the policy's fixed task prompt. The worker makes changes in the approved checkout in place; edits from a failed or stopped run are kept, not rolled back."],
-    ["Worker total limit", secsLabel(l.total, "no overall cap")],
+    ["Allowed commit scope", `${scopeText(o.scopes, "\n")}\nExact paths tasks may commit, quoted so spaces show. This is not a filesystem sandbox.`],
+    ["Tasks", `${taskWord}. Your objective is appended to each task prompt. ${checkoutMode}`],
+    ["Worker total limit", secsLabel(l.total, l.startup !== null ? "watchdog-only, no overall cap" : "no overall cap")],
     ["Worker startup limit", secsLabel(l.startup, "no watchdog")],
     ["Worker idle limit", secsLabel(l.idle, "no watchdog")],
     ["Gate limit", secsLabel(l.gate)],
@@ -985,7 +994,9 @@ function renderLaunch() {
         r.value = o.id;
         r.dataset.fk = o.id;
         r.checked = o.id === L.sel;
-        lab.append(r, document.createTextNode(o.label), el("span", "opt-meta", `commit scope ${scopeText(o.scopes, ", ")} · 1 task · ${workerLimits(o)}`));
+        const taskCount = o.tasks === 1 ? "1 task" : `${o.tasks} serial tasks`;
+        const wtTag = o.worktree ? " · isolated worktree" : "";
+        lab.append(r, document.createTextNode(o.label), el("span", "opt-meta", `commit scope ${scopeText(o.scopes, ", ")} · ${taskCount}${wtTag} · ${workerLimits(o)}`));
         return lab;
       }),
     );

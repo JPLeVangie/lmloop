@@ -1212,19 +1212,22 @@ fn pilot_policy_is_set_by_the_cli_alone_and_needs_an_isolated_state_root() {
         p
     };
 
-    // A manifest cannot opt in, and a pilot is at most three tasks (four are refused).
+    // A manifest cannot opt in, and a pilot is at most sixteen tasks (seventeen are refused).
     let mut optin = v.clone();
     optin["pilot"] = json!(true);
     let p = edit(&s, &optin);
     assert_eq!(code(&s.run("r1", &p, None)), 2);
     assert_eq!(code(&pilot(&s, "r1", &p)), 2);
-    let task = v["tasks"][0].clone();
-    v["tasks"] = json!([task, { "id": "t2", "prompt": "ok|docs/b|b", "scopes": ["docs/b"] },
-        { "id": "t3", "prompt": "ok|docs/c|c", "scopes": ["docs/c"] },
-        { "id": "t4", "prompt": "ok|docs/d|d", "scopes": ["docs/d"] }]);
+    let many: Vec<Value> = (1..=17)
+        .map(|i| {
+            let file = format!("docs/t{i}.txt");
+            json!({ "id": format!("t{i}"), "prompt": format!("ok|{file}|v{i}"), "scopes": [file] })
+        })
+        .collect();
+    v["tasks"] = json!(many);
     let out = pilot(&s, "r1", &edit(&s, &v));
     assert_eq!(code(&out), 2);
-    assert!(String::from_utf8_lossy(&out.stderr).contains("1-3 tasks"));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("1-16 tasks"));
     let mut no_tasks = v.clone();
     no_tasks["tasks"] = json!([]);
     assert_eq!(code(&pilot(&s, "r1", &edit(&s, &no_tasks))), 2);
@@ -2156,4 +2159,290 @@ fn the_pilot_hook_runs_under_the_checkout_guard_and_a_refusal_publishes_nothing(
     // An accepting hook lets the run go on.
     let out = lmloop::serial::start_pilot_guarded(&store, "r3", policy(), |_| Ok(())).unwrap();
     assert!(matches!(out, lmloop::serial::Finish::Complete));
+}
+
+fn fixture(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(name)
+}
+
+#[test]
+fn multi_task_pilot_writes_handoff_and_passes_prior_context_to_next_task() {
+    let s = Scratch::new("handoff");
+    let capture = s.0.join("capture-worker");
+    fs::write(
+        &capture,
+        "#!/bin/sh\n\
+         prompt=\"$1\"\n\
+         first=$(printf '%s' \"$prompt\" | head -n 1)\n\
+         IFS='|' read -r _ path dump <<EOP\n\
+         $first\n\
+         EOP\n\
+         mkdir -p \"$(dirname \"$path\")\"\n\
+         printf '%s\\n' \"$prompt\" > \"$path\"\n\
+         printf '%s' \"$prompt\" > \"$dump\"\n\
+         sid=\"ses_$(date +%s%N)_$$\"\n\
+         printf '{\"type\":\"step_start\",\"sessionID\":\"%s\"}\\n' \"$sid\"\n\
+         printf '{\"type\":\"step_finish\",\"sessionID\":\"%s\",\"part\":{\"reason\":\"stop\"}}\\n' \"$sid\"\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&capture, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let d1 = s.0.join("p1.txt");
+    let d2 = s.0.join("p2.txt");
+    let d3 = s.0.join("p3.txt");
+    let manifest = s.0.join("handoff-pilot.json");
+    fs::write(
+        &manifest,
+        json!({
+            "manifest_version": 1,
+            "repo": s.repo(),
+            "worker": { "argv": [capture], "timeout_secs": 30 },
+            "gate": { "argv": [fixture("gate-no-fail")], "timeout_secs": 30 },
+            "tasks": [
+                { "id": "t1", "prompt": format!("ok|src/a.txt|{}", d1.display()), "scopes": ["src/a.txt"] },
+                { "id": "t2", "prompt": format!("ok|src/b.txt|{}", d2.display()), "scopes": ["src/b.txt"] },
+                { "id": "t3", "prompt": format!("ok|src/c.txt|{}", d3.display()), "scopes": ["src/c.txt"] },
+            ]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let out = pilot(&s, "r1", &manifest);
+    assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
+    let p1 = fs::read_to_string(&d1).unwrap();
+    let p2 = fs::read_to_string(&d2).unwrap();
+    let p3 = fs::read_to_string(&d3).unwrap();
+    assert!(
+        !p1.contains("Prior committed tasks"),
+        "task 1 had handoff: {p1}"
+    );
+    assert!(
+        p2.contains("Prior committed tasks"),
+        "task 2 missing handoff: {p2}"
+    );
+    assert!(
+        p2.contains("t1") && p2.contains("src/a.txt"),
+        "task 2 missing t1 summary: {p2}"
+    );
+    assert!(
+        p2.contains("src/b.txt"),
+        "task 2 missing own scope reminder: {p2}"
+    );
+    assert!(
+        p3.contains("t1")
+            && p3.contains("t2")
+            && p3.contains("src/a.txt")
+            && p3.contains("src/b.txt"),
+        "task 3 missing prior summaries: {p3}"
+    );
+    let handoff = fs::read_to_string(s.run_dir("r1").join("handoff.md")).unwrap();
+    assert!(handoff.contains("t1") && handoff.contains("t2") && handoff.contains("t3"));
+    let view = lmloop::operator::Operator::new(&s.0.join("state"))
+        .view("r1")
+        .unwrap();
+    assert_eq!(view.tasks.len(), 3);
+    assert_eq!(view.tasks[0].changed, vec!["src/a.txt"]);
+    assert_eq!(view.tasks[1].changed, vec!["src/b.txt"]);
+    assert_eq!(view.tasks[2].changed, vec!["src/c.txt"]);
+
+    // Subsequent tasks reserve headroom for the bounded handoff so composed prompts never exceed 16 KiB.
+    let oversized = s.0.join("handoff-oversize.json");
+    fs::write(
+        &oversized,
+        json!({
+            "manifest_version": 1,
+            "repo": s.repo(),
+            "worker": { "argv": [fixture("fake-opencode")], "timeout_secs": 30 },
+            "gate": { "argv": [fixture("gate-no-fail")], "timeout_secs": 30 },
+            "tasks": [
+                { "id": "t1", "prompt": "ok|src/a.txt|1", "scopes": ["src/a.txt"] },
+                { "id": "t2", "prompt": "x".repeat(13 * 1024), "scopes": ["src/b.txt"] },
+            ]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let bad = pilot(&s, "r-big", &oversized);
+    assert_eq!(code(&bad), 2, "{}", String::from_utf8_lossy(&bad.stderr));
+    assert!(!s.run_dir("r-big").exists());
+}
+
+#[test]
+fn isolated_worktree_commits_on_branch_and_leaves_base_checkout_clean() {
+    let s = Scratch::new("worktree");
+    let wt_root = s.0.join("worktrees");
+    fs::create_dir_all(&wt_root).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // Group/world-accessible worktree root is refused before creating a run.
+        fs::set_permissions(&wt_root, fs::Permissions::from_mode(0o755)).unwrap();
+        let bad_perm = s.0.join("wt-perm.json");
+        fs::write(
+            &bad_perm,
+            json!({
+                "manifest_version": 1,
+                "repo": s.repo(),
+                "worktree": { "root": wt_root, "branch_prefix": "pilot" },
+                "worker": { "argv": [fixture("fake-opencode")], "timeout_secs": 30 },
+                "gate": { "argv": [fixture("gate-no-fail")], "timeout_secs": 30 },
+                "tasks": [{ "id": "t1", "prompt": "ok|src/a.txt|one", "scopes": ["src/a.txt"] }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let out = pilot(&s, "wt-perm", &bad_perm);
+        assert_eq!(code(&out), 2, "{}", String::from_utf8_lossy(&out.stderr));
+        assert!(!s.run_dir("wt-perm").exists());
+        fs::set_permissions(&wt_root, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let base_head = s.head();
+    let manifest = s.0.join("wt-pilot.json");
+    fs::write(
+        &manifest,
+        json!({
+            "manifest_version": 1,
+            "repo": s.repo(),
+            "worktree": { "root": wt_root, "branch_prefix": "pilot" },
+            "worker": { "argv": [fixture("fake-opencode")], "timeout_secs": 30 },
+            "gate": { "argv": [fixture("gate-no-fail")], "timeout_secs": 30 },
+            "tasks": [
+                { "id": "t1", "prompt": "ok|src/a.txt|one", "scopes": ["src/a.txt"] },
+                { "id": "t2", "prompt": "ok|docs/b.txt|two", "scopes": ["docs/b.txt"] },
+            ]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let out = pilot(&s, "wt1", &manifest);
+    assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
+    // Base checkout was never modified and stayed at its original HEAD.
+    assert_eq!(s.head(), base_head);
+    assert!(!s.repo().join("src/a.txt").exists());
+    assert!(!s.repo().join("docs/b.txt").exists());
+    assert!(lmloop::git::Repo::open(&s.repo()).is_ok());
+
+    // Isolated worktree holds both commits on branch pilot/wt1.
+    let wt_dir = wt_root.join("wt1");
+    assert!(wt_dir.join("src/a.txt").exists());
+    assert!(wt_dir.join("docs/b.txt").exists());
+    let wt_repo = lmloop::git::Repo::open(&wt_dir).unwrap();
+    assert_eq!(wt_repo.ref_name, "refs/heads/pilot/wt1");
+    assert_ne!(wt_repo.head, base_head);
+    let view = lmloop::operator::Operator::new(&s.0.join("state"))
+        .view("wt1")
+        .unwrap();
+    assert_eq!(view.branch.as_deref(), Some("pilot/wt1"));
+    assert_eq!(view.tasks.len(), 2);
+    // Repo-scoped listing matches both the base checkout and the isolated worktree checkout.
+    let op = lmloop::operator::Operator::new(&s.0.join("state"));
+    assert_eq!(
+        op.list_runs_in(&fs::canonicalize(s.repo()).unwrap())
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        op.list_runs_in(&fs::canonicalize(&wt_dir).unwrap())
+            .unwrap()
+            .len(),
+        1
+    );
+
+    // A failure in an isolated worktree preserves the worktree for inspection while leaving base clean.
+    let fail_manifest = s.0.join("wt-fail.json");
+    fs::write(
+        &fail_manifest,
+        json!({
+            "manifest_version": 1,
+            "repo": s.repo(),
+            "worktree": { "root": wt_root, "branch_prefix": "pilot" },
+            "worker": { "argv": [fixture("fake-opencode")], "timeout_secs": 30 },
+            "gate": { "argv": [fixture("gate-no-fail")], "timeout_secs": 30 },
+            "tasks": [
+                { "id": "t1", "prompt": "ok|src/a.txt|one", "scopes": ["src/a.txt"] },
+                { "id": "t2", "prompt": "exit1|docs/b.txt|partial", "scopes": ["docs/b.txt"] },
+            ]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let out = pilot(&s, "wt2", &fail_manifest);
+    assert_eq!(code(&out), 10, "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(s.head(), base_head);
+    assert!(lmloop::git::Repo::open(&s.repo()).is_ok());
+    assert!(
+        wt_root.join("wt2/docs/b.txt").exists(),
+        "failed work preserved in isolated worktree"
+    );
+
+    // Overlapping worktree.root (inside repo or state root) is refused with exit 2 and creates no run dir.
+    for bad_root in [s.repo().join("nested"), s.0.join("state/nested")] {
+        fs::create_dir_all(&bad_root).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&bad_root, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let bad = s.0.join("wt-bad.json");
+        fs::write(
+            &bad,
+            json!({
+                "manifest_version": 1,
+                "repo": s.repo(),
+                "worktree": { "root": bad_root },
+                "worker": { "argv": [fixture("fake-opencode")], "timeout_secs": 30 },
+                "gate": { "argv": [fixture("gate-no-fail")], "timeout_secs": 30 },
+                "tasks": [{ "id": "t1", "prompt": "ok|src/a.txt|one", "scopes": ["src/a.txt"] }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let out = pilot(&s, "wt-bad", &bad);
+        assert_eq!(code(&out), 2, "{}", String::from_utf8_lossy(&out.stderr));
+        assert!(!s.run_dir("wt-bad").exists());
+    }
+}
+
+#[test]
+fn watchdog_only_multi_task_pilot_completes_without_total_timeout() {
+    let s = Scratch::new("dog-multi");
+    let prog = s.0.join("progress.log");
+    fs::write(&prog, "").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&prog, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let manifest = s.0.join("dog-multi.json");
+    fs::write(
+        &manifest,
+        json!({
+            "manifest_version": 1,
+            "repo": s.repo(),
+            "worker": {
+                "argv": [fixture("fake-opencode")],
+                "watchdog": { "startup_secs": 4, "idle_secs": 2, "progress_file": prog }
+            },
+            "gate": { "argv": [fixture("gate-no-fail")], "timeout_secs": 30 },
+            "tasks": [
+                { "id": "t1", "prompt": format!("pulse|src/one.txt|{}", prog.display()), "scopes": ["src/one.txt"] },
+                { "id": "t2", "prompt": format!("pulse|docs/two.txt|{}", prog.display()), "scopes": ["docs/two.txt"] },
+            ]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let out = pilot(&s, "dog1", &manifest);
+    assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
+    let view = lmloop::operator::Operator::new(&s.0.join("state"))
+        .view("dog1")
+        .unwrap();
+    assert!(view.complete);
+    assert_eq!(view.tasks.len(), 2);
 }

@@ -61,7 +61,10 @@ pub const MANIFEST_VERSION: u32 = 1;
 const MAX_MANIFEST_BYTES: u64 = 1 << 20;
 const MAX_PROMPT_BYTES: usize = 16 * 1024;
 const MAX_TASKS: usize = 16;
-const MAX_PILOT_TASKS: usize = 3;
+pub const MAX_PILOT_TASKS: usize = 16;
+const MAX_HANDOFF_BYTES: usize = 4096;
+const HANDOFF_HEADER: &str =
+    "\n\nPrior committed tasks in this run (already on HEAD; do not redo them):\n";
 const MAX_EXPORT_ENTRIES: usize = 5000;
 const MAX_EXPORT_BYTES: u64 = 256 << 20;
 const MAX_TIMEOUT_SECS: u64 = 3600;
@@ -129,6 +132,29 @@ pub struct Policy {
     /// Run with the exported tree as cwd; exit 0 is the only pass.
     pub gate: Cmd,
     pub tasks: Vec<Task>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<WorktreeConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorktreeConfig {
+    pub root: PathBuf,
+    #[serde(default = "default_branch_prefix")]
+    pub branch_prefix: String,
+}
+
+fn default_branch_prefix() -> String {
+    "lmloop".into()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorktreeState {
+    pub path: PathBuf,
+    pub branch: String,
+    pub base_ref: String,
+    pub base_head: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -158,6 +184,8 @@ pub struct Intent {
     pub commit: String,
     pub session_id: String,
     pub gate_log: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub changed: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -169,6 +197,8 @@ pub struct Done {
     pub tree: String,
     pub commit: String,
     pub gate_log: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub changed: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -194,6 +224,16 @@ pub struct RunState {
     /// Set by `pilot-run` only, never by a manifest; absent in older state means fixture.
     #[serde(default)]
     pub pilot: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<WorktreeState>,
+}
+
+impl RunState {
+    pub fn active_repo(&self) -> &Path {
+        self.worktree
+            .as_ref()
+            .map_or(self.policy.repo.as_path(), |w| w.path.as_path())
+    }
 }
 
 pub enum Finish {
@@ -262,18 +302,44 @@ fn validate(p: &Policy, pilot: bool) -> std::result::Result<(), String> {
     if p.tasks.is_empty() || p.tasks.len() > MAX_TASKS {
         return Err(format!("tasks must number 1-{MAX_TASKS}"));
     }
+    if let Some(w) = &p.worktree {
+        let prefix = &w.branch_prefix;
+        if !w.root.is_absolute() || w.root.as_os_str().as_encoded_bytes().contains(&0) {
+            return Err("worktree.root must be an absolute path without NUL".into());
+        }
+        let bad_prefix = prefix.is_empty()
+            || prefix.len() > 64
+            || prefix.starts_with('/')
+            || prefix.ends_with('/')
+            || prefix.contains("..")
+            || prefix.contains("//")
+            || prefix.split('/').any(|s| {
+                s.is_empty()
+                    || s.starts_with('.')
+                    || s.ends_with('.')
+                    || s.ends_with(".lock")
+                    || !s
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
+            });
+        if bad_prefix {
+            return Err("worktree.branch_prefix is invalid".into());
+        }
+    }
     for (i, t) in p.tasks.iter().enumerate() {
         state::validate_run_id(&t.id)
             .map_err(|_| format!("task id {:?} is not a simple id", t.id))?;
         if p.tasks[..i].iter().any(|o| o.id == t.id) {
             return Err(format!("duplicate task id {:?}", t.id));
         }
-        if t.prompt.trim().is_empty()
-            || t.prompt.len() > MAX_PROMPT_BYTES
-            || t.prompt.contains('\0')
-        {
+        let max_prompt = if i == 0 {
+            MAX_PROMPT_BYTES
+        } else {
+            MAX_PROMPT_BYTES - HANDOFF_HEADER.len() - MAX_HANDOFF_BYTES
+        };
+        if t.prompt.trim().is_empty() || t.prompt.len() > max_prompt || t.prompt.contains('\0') {
             return Err(format!(
-                "task {:?}: prompt must be 1-{MAX_PROMPT_BYTES} bytes",
+                "task {:?}: prompt must be 1-{max_prompt} bytes",
                 t.id
             ));
         }
@@ -306,8 +372,9 @@ pub fn load_private_pilot_manifest(path: &Path) -> std::result::Result<Policy, S
 /// A one-task pilot template with the requester's objective appended to the task prompt,
 /// revalidated (so the prompt size cap still holds). Only the prompt changes.
 pub fn with_objective(mut p: Policy, objective: &str) -> std::result::Result<Policy, String> {
-    let t = p.tasks.first_mut().ok_or("template has no task")?;
-    t.prompt = format!("{}\n\nObjective:\n{objective}", t.prompt);
+    for t in &mut p.tasks {
+        t.prompt = format!("{}\n\nObjective:\n{objective}", t.prompt);
+    }
     validate(&p, true)?;
     Ok(p)
 }
@@ -329,6 +396,81 @@ fn parse(text: &str, pilot: bool) -> std::result::Result<Policy, String> {
     Ok(policy)
 }
 
+fn write_handoff(dir: &Path, body: &str) -> Result<()> {
+    let tmp = dir.join(format!("handoff.{}.tmp", std::process::id()));
+    let dest = dir.join("handoff.md");
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&tmp)
+        .map_err(io_err(&tmp))?;
+    file.write_all(body.as_bytes())
+        .and_then(|()| file.sync_all())
+        .map_err(io_err(&tmp))?;
+    fs::rename(&tmp, &dest).map_err(io_err(&dest))?;
+    File::open(dir)
+        .and_then(|d| d.sync_all())
+        .map_err(io_err(dir))
+}
+
+fn short(oid: &str) -> &str {
+    &oid[..oid.len().min(12)]
+}
+
+fn render_handoff(done: &[Done], head: &str, scopes: &[String]) -> String {
+    let mut body = String::new();
+    for (n, d) in done.iter().enumerate() {
+        let files = if d.changed.is_empty() {
+            String::new()
+        } else {
+            const MAX_FILES: usize = 16;
+            let shown = d
+                .changed
+                .iter()
+                .take(MAX_FILES)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ");
+            if d.changed.len() > MAX_FILES {
+                format!(": {shown} (+{} more)", d.changed.len() - MAX_FILES)
+            } else {
+                format!(": {shown}")
+            }
+        };
+        let line = format!(
+            "{}. {} (commit {}, gate passed){files}\n",
+            n + 1,
+            d.task,
+            short(&d.commit)
+        );
+        if body.len() + line.len() + 128 > MAX_HANDOFF_BYTES {
+            body.push_str("... (additional tasks omitted for length)\n");
+            break;
+        }
+        body.push_str(&line);
+    }
+    let tail = if scopes.is_empty() {
+        format!("Current clean HEAD: {}.", short(head))
+    } else {
+        format!(
+            "Start from current clean HEAD ({}). Only modify files within your allowed scopes: {}.",
+            short(head),
+            scopes.join(", ")
+        )
+    };
+    body.push_str(&tail);
+    if body.len() > MAX_HANDOFF_BYTES {
+        let mut end = MAX_HANDOFF_BYTES;
+        while !body.is_char_boundary(end) {
+            end -= 1;
+        }
+        body.truncate(end);
+    }
+    body
+}
 /// Atomic publish: temp file, fsync, rename, fsync the directory. One writer: the lease holder.
 fn write_json<T: Serialize>(dir: &Path, name: &str, value: &T) -> Result<()> {
     let tmp = dir.join(format!("{name}.{}.tmp", std::process::id()));
@@ -939,7 +1081,8 @@ fn task(c: &mut Ctx) -> Result<Option<Finish>> {
     let policy = c.st.policy.clone();
     let t = policy.tasks[c.st.next_task].clone();
     let id = t.id.as_str();
-    let repo = match Repo::open(&policy.repo) {
+    let active_repo = c.st.active_repo().to_path_buf();
+    let repo = match Repo::open(&active_repo) {
         Ok(r) => r,
         Err(e) => return c.fail(id, e.kind, &e.message),
     };
@@ -952,20 +1095,29 @@ fn task(c: &mut Ctx) -> Result<Option<Finish>> {
     )?;
 
     let mut dog = match &policy.worker.watchdog {
-        Some(cfg) => match Dog::start(c.dir, &policy.repo, &t, cfg, c.st.next_task == 0) {
+        Some(cfg) => match Dog::start(c.dir, &active_repo, &t, cfg, c.st.next_task == 0) {
             Ok(d) => Some(d),
             Err(e) => return c.fail(id, "watchdog_unavailable", &e.message),
         },
         None => None,
     };
     let mut argv = policy.worker.argv.clone();
-    argv.push(t.prompt.clone());
+    let prompt = if c.st.done.is_empty() {
+        t.prompt.clone()
+    } else {
+        format!(
+            "{}{HANDOFF_HEADER}{}",
+            t.prompt,
+            render_handoff(&c.st.done, &repo.head, &t.scopes)
+        )
+    };
+    argv.push(prompt);
     let watched = dog.is_some();
     let mut watch = |out: &[u8]| dog.as_mut().and_then(|d| d.observe(out));
     let (rec, stdout) = supervised(
         c.dir,
         &argv,
-        &policy.repo,
+        &active_repo,
         policy.worker.timeout_secs.map(Duration::from_secs),
         WORKER_STREAM_BYTES,
         watched.then_some(&mut watch),
@@ -1058,6 +1210,7 @@ fn task(c: &mut Ctx) -> Result<Option<Finish>> {
         commit: oid.clone(),
         session_id: summary.session_id,
         gate_log: grec.log.clone().unwrap_or_default(),
+        changed: snap.changed.clone(),
     });
     c.st.phase = RunPhase::Committing;
     c.save()?; // durable before the ref moves
@@ -1109,7 +1262,8 @@ fn finish_commit(c: &mut Ctx) -> Result<()> {
             .ok_or_else(|| Error::new("state", "no commit intent"))?;
     // update-ref leaves the real index on the old tree, which would read as a dirty
     // baseline next task. Index only: the worktree already equals the tree.
-    sync_index(&c.st.policy.repo, &i)?;
+    let active_repo = c.st.active_repo().to_path_buf();
+    sync_index(&active_repo, &i)?;
     c.st.intent = None;
     c.st.done.push(Done {
         task: i.task.clone(),
@@ -1118,14 +1272,25 @@ fn finish_commit(c: &mut Ctx) -> Result<()> {
         tree: i.tree,
         commit: i.commit.clone(),
         gate_log: i.gate_log,
+        changed: i.changed.clone(),
     });
     c.st.next_task += 1;
     c.st.phase = RunPhase::Idle;
     c.save()?;
+    let head =
+        c.st.done
+            .last()
+            .map_or(i.commit.as_str(), |d| d.commit.as_str());
+    let scopes =
+        c.st.policy
+            .tasks
+            .get(c.st.next_task)
+            .map_or(&[][..], |t| t.scopes.as_slice());
+    write_handoff(c.dir, &render_handoff(&c.st.done, head, scopes))?;
     c.emit(
         "task_committed",
         Some(&i.task),
-        json!({ "commit": i.commit }),
+        json!({ "commit": i.commit, "changed": i.changed }),
     )
 }
 
@@ -1208,6 +1373,40 @@ fn checkout(repo: &Path) -> Result<std::result::Result<Option<lease::Lease>, ()>
     Ok(lease::claim_checkout(&git_dir)?.map(Some).ok_or(()))
 }
 
+fn paths_overlap(a: &Path, b: &Path) -> bool {
+    a.starts_with(b) || b.starts_with(a)
+}
+
+fn check_worktree_bounds(
+    store: &Store,
+    policy: &Policy,
+    wt_root: &Path,
+) -> std::result::Result<(), String> {
+    let state_base = store.base().parent().unwrap_or_else(|| store.base());
+    let state_canon = fs::canonicalize(state_base).unwrap_or_else(|_| state_base.to_path_buf());
+    if paths_overlap(wt_root, &state_canon) || paths_overlap(wt_root, store.base()) {
+        return Err("worktree.root must not overlap the state root".into());
+    }
+    if let Some(wd) = &policy.worker.watchdog {
+        let pf = fs::canonicalize(&wd.progress_file).unwrap_or_else(|_| {
+            wd.progress_file
+                .parent()
+                .and_then(|p| fs::canonicalize(p).ok())
+                .map_or_else(
+                    || wd.progress_file.clone(),
+                    |p| match wd.progress_file.file_name() {
+                        Some(n) => p.join(n),
+                        None => p,
+                    },
+                )
+        });
+        if paths_overlap(wt_root, &pf) {
+            return Err("worktree.root must not overlap worker.watchdog.progress_file".into());
+        }
+    }
+    Ok(())
+}
+
 fn begin(
     store: &Store,
     run_id: &str,
@@ -1215,9 +1414,24 @@ fn begin(
     pilot: bool,
     under_guard: impl FnOnce(&Policy) -> Result<()>,
 ) -> Result<Finish> {
-    // First, so a busy checkout leaves no run directory behind. Held until `drive` returns.
-    let Ok(_checkout) = checkout(&policy.repo)? else {
-        return Ok(Finish::CheckoutBusy);
+    // First, so a busy checkout leaves no run directory behind and worktree validation runs under guard.
+    let base_checkout = match checkout(&policy.repo)? {
+        Ok(g) => g,
+        Err(()) => return Ok(Finish::CheckoutBusy),
+    };
+    // Pin and validate isolated worktree destination under the checkout guard before any one-shot hook.
+    let pinned_wt_root = if let Some(w) = &policy.worktree {
+        let (wt_root, _) =
+            match git::precheck_worktree(&policy.repo, &w.root, run_id, &w.branch_prefix) {
+                Ok(v) => v,
+                Err(e) => return Ok(Finish::Usage(e.message)),
+            };
+        if let Err(msg) = check_worktree_bounds(store, &policy, &wt_root) {
+            return Ok(Finish::Usage(msg));
+        }
+        Some(wt_root)
+    } else {
+        None
     };
     under_guard(&policy)?;
     let dir = store.run_dir(run_id, true)?.expect("created");
@@ -1242,6 +1456,45 @@ fn begin(
         Ok(l) => l,
         Err(f) => return Ok(f),
     };
+    let mut worktree_state = None;
+    let _active_checkout = if let (Some(w), Some(wt_root)) = (&policy.worktree, pinned_wt_root) {
+        let current = fs::canonicalize(&w.root).map_err(io_err(&w.root))?;
+        if current != wt_root {
+            return Err(Error::new(
+                "worktree",
+                "worktree root changed before creation",
+            ));
+        }
+        check_worktree_bounds(store, &policy, &wt_root)
+            .map_err(|msg| Error::new("worktree", msg))?;
+        let created = git::create_worktree(&policy.repo, &wt_root, run_id, &w.branch_prefix)?;
+        check_worktree_bounds(store, &policy, &created.path)
+            .map_err(|msg| Error::new("worktree", msg))?;
+        let wt_guard = match checkout(&created.path)? {
+            Ok(g) => g,
+            Err(()) => return Ok(Finish::CheckoutBusy),
+        };
+        // Release the base checkout guard immediately; all mutations stay in the linked worktree.
+        drop(base_checkout);
+        worktree_state = Some(WorktreeState {
+            path: created.path,
+            branch: created.branch,
+            base_ref: created.base_ref,
+            base_head: created.base_head,
+        });
+        wt_guard
+    } else {
+        base_checkout
+    };
+    let started_data = match &worktree_state {
+        Some(w) => json!({
+            "tasks": policy.tasks.len(),
+            "pilot": pilot,
+            "worktree_branch": w.branch,
+            "base_head": w.base_head,
+        }),
+        None => json!({ "tasks": policy.tasks.len(), "pilot": pilot }),
+    };
     let mut c = Ctx {
         dir: &dir,
         log,
@@ -1256,14 +1509,11 @@ fn begin(
             failure: None,
             updated_at_unix: 0,
             pilot,
+            worktree: worktree_state,
         },
     };
     c.save()?;
-    c.emit(
-        "run_started",
-        None,
-        json!({ "tasks": c.st.policy.tasks.len(), "pilot": pilot }),
-    )?;
+    c.emit("run_started", None, started_data)?;
     drive(&mut c)
 }
 
@@ -1289,7 +1539,7 @@ pub fn resume(store: &Store, run_id: &str) -> Result<Finish> {
         st.phase,
         RunPhase::Paused | RunPhase::Idle | RunPhase::Committing
     ) {
-        match checkout(&st.policy.repo)? {
+        match checkout(st.active_repo())? {
             Ok(Some(g)) => Some(g),
             Ok(None) => {
                 // A resume that may commit never goes on unguarded.
@@ -1323,7 +1573,7 @@ pub fn resume(store: &Store, run_id: &str) -> Result<Finish> {
                 .intent
                 .clone()
                 .ok_or_else(|| Error::new("malformed", "committing without intent"))?;
-            let repo = &st.policy.repo;
+            let repo = st.active_repo();
             let rev = |spec: &str| git(repo, &["rev-parse", "--verify", "-q", spec]).ok();
             let attached = git(repo, &["symbolic-ref", "-q", "HEAD"]).ok().as_deref()
                 == Some(i.ref_name.as_str());

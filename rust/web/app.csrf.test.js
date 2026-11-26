@@ -52,7 +52,7 @@ function load(config, extra = {}) {
     },
   };
   vm.createContext(ctx);
-  vm.runInContext(fs.readFileSync(path.join(__dirname, "app.js"), "utf8") + "\n;globalThis.__t = { post, request, api, refresh, state, groupRuns, renderRuns, normalizeOptions, objectiveGap, launchRun, submitLaunch, loadLaunchOptions };", ctx);
+  vm.runInContext(fs.readFileSync(path.join(__dirname, "app.js"), "utf8") + "\n;globalThis.__t = { post, request, api, refresh, state, groupRuns, renderRuns, normalizeOptions, objectiveGap, launchRun, submitLaunch, loadLaunchOptions, launchRows };", ctx);
   const settle = async () => {
     for (let i = 0; i < 50 && ctx.__t.state.refreshing; i++) await new Promise((r) => setImmediate(r));
   };
@@ -185,13 +185,22 @@ test("launch options: disabled, eligible, ineligible and malformed entries", () 
 
 test("launch options: unset limits stay unset; malformed eligible entries become unavailable", () => {
   const t = load({});
-  const dog = { ...BUDGET, worker_timeout_secs: null, worker_startup_secs: 1200, worker_idle_secs: 300 };
-  const [o] = t.normalizeOptions(wrap({ ...P, budget: dog })).options;
+  const dog = { ...BUDGET, tasks: 4, worker_timeout_secs: null, worker_startup_secs: 1200, worker_idle_secs: 300 };
+  const [o] = t.normalizeOptions(wrap({ ...P, worktree: true, budget: dog })).options;
   assert.deepEqual({ ...o.limits }, { total: null, startup: 1200, idle: 300, gate: 600 });
+  assert.equal(o.tasks, 4);
+  assert.equal(o.worktree, true);
+  const rows = t.launchRows(o, "ship it");
+  const taskRow = rows.find(([k]) => k === "Tasks")[1];
+  const totalRow = rows.find(([k]) => k === "Worker total limit")[1];
+  assert.match(taskRow, /4 serial tasks/);
+  assert.match(taskRow, /isolated Git worktree/);
+  assert.match(totalRow, /watchdog-only/);
   const bad = [
     { ...BUDGET, gate_timeout_secs: null }, // the backend always has a hard gate limit
     { ...BUDGET, gate_timeout_secs: undefined },
-    { ...BUDGET, tasks: 2 },
+    { ...BUDGET, tasks: 0 },
+    { ...BUDGET, tasks: 17 },
     { ...BUDGET, worker_timeout_secs: 0 },
     { ...BUDGET, worker_timeout_secs: "9" },
     { ...BUDGET, worker_timeout_secs: null }, // neither a total nor a watchdog

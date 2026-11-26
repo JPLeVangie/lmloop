@@ -604,11 +604,16 @@ fn review_lines(root: &Path, id: &str, manifest: &Path, p: &Policy) -> Vec<Line<
             None => format!("{:?} {cap}", c.argv),
         }
     };
+    let banner = if p.tasks.len() == 1 {
+        "PILOT: one task, one shot, not production verification".to_string()
+    } else {
+        format!(
+            "PILOT: {} serial tasks, one shot, not production verification",
+            p.tasks.len()
+        )
+    };
     let mut out = vec![
-        Line::styled(
-            "PILOT: one task, one shot, not production verification",
-            bold,
-        ),
+        Line::styled(banner, bold),
         Line::from(format!("repo: {}", flat(&p.repo.display().to_string()))),
         Line::from(format!(
             "state root: {}  run id: {id}",
@@ -621,6 +626,14 @@ fn review_lines(root: &Path, id: &str, manifest: &Path, p: &Policy) -> Vec<Line<
         Line::from(format!("worker: {}", argv(&p.worker))),
         Line::from(format!("gate: {}", argv(&p.gate))),
     ];
+    if let Some(wt) = &p.worktree {
+        out.push(Line::from(format!(
+            "worktree: {}  branch: {}/{}",
+            flat(&wt.root.display().to_string()),
+            flat(&wt.branch_prefix),
+            flat(id),
+        )));
+    }
     for t in &p.tasks {
         out.push(Line::styled(
             format!("task {} scopes {:?}", t.id, t.scopes),
@@ -867,6 +880,9 @@ fn detail_lines(v: &RunView) -> Vec<Line<'static>> {
             if s.owner_lost { "  OWNER LOST" } else { "" }
         )),
     ];
+    if let Some(branch) = &v.branch {
+        out.push(Line::from(format!("worktree branch: {branch}")));
+    }
     if let Some(l) = &s.lease {
         out.push(Line::from(format!(
             "lease {:?}{}",

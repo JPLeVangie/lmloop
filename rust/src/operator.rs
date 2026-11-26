@@ -161,6 +161,9 @@ pub struct TaskView {
     pub commit: Option<String>,
     /// Name for `read_log`; only committed tasks have one.
     pub gate_log: Option<String>,
+    /// Exact changed paths committed by this task.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub changed: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -189,6 +192,9 @@ pub struct RunView {
     pub events: Vec<EventView>,
     /// Latest worker-watchdog evidence (kept after a failure), if the run used one.
     pub watchdog: Option<serial::WatchdogEvidence>,
+    /// Isolated Git worktree branch name, if this run executed in an isolated worktree.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
     pub warnings: Vec<String>,
 }
 
@@ -282,7 +288,12 @@ impl Operator {
                 (Ok((_, ins)), None) => Some(summarize(&id, &ins)),
                 (Ok((_, ins)), Some(r)) => match &ins.loaded {
                     Loaded::Serial(st)
-                        if fs::canonicalize(&st.policy.repo).is_ok_and(|c| c == r) =>
+                        if fs::canonicalize(&st.policy.repo).is_ok_and(|c| c == r)
+                            || st
+                                .worktree
+                                .as_ref()
+                                .and_then(|w| fs::canonicalize(&w.path).ok())
+                                .is_some_and(|c| c == r) =>
                     {
                         Some(summarize(&id, &ins))
                     }
@@ -312,7 +323,7 @@ impl Operator {
             warnings.push(clean(&e.to_string(), false));
             None
         });
-        let (tasks, complete, evidence) = match &ins.loaded {
+        let (tasks, complete, evidence, branch) = match &ins.loaded {
             Loaded::Serial(st) => (
                 tasks(st),
                 st.phase == RunPhase::Complete && st.done.len() == st.policy.tasks.len(),
@@ -321,8 +332,9 @@ impl Operator {
                 } else {
                     SERIAL_EVIDENCE
                 },
+                st.worktree.as_ref().map(|w| clean(&w.branch, false)),
             ),
-            Loaded::Diagnostic(_) => (Vec::new(), false, state::EVIDENCE),
+            Loaded::Diagnostic(_) => (Vec::new(), false, state::EVIDENCE, None),
         };
         Ok(RunView {
             summary: summarize(&id, &ins),
@@ -334,6 +346,7 @@ impl Operator {
             logs,
             events,
             watchdog,
+            branch,
             warnings,
         })
     }
@@ -653,8 +666,8 @@ fn actions(loaded: &Loaded, held: bool, pending: &[String], decided: bool) -> Ac
     } else {
         Available::yes("records the request only; nothing is changed, discarded or relaunched")
     };
-    // A pilot has one task and is never resumable: no boundary to pause or stop at, nothing to
-    // resume. STOP-NOW (interrupts the in-flight worker or gate) is its only control.
+    // A pilot is one-shot and never resumable: no pause or resume. Single-task pilots have no
+    // task boundary to stop at either; multi-task pilots allow graceful task-boundary STOP.
     let one_shot = |a: Available| {
         if st.pilot && a.available {
             Available::no(
@@ -664,9 +677,14 @@ fn actions(loaded: &Loaded, held: bool, pending: &[String], decided: bool) -> Ac
             a
         }
     };
+    let pilot_stop = if st.pilot && st.policy.tasks.len() > 1 {
+        stop
+    } else {
+        one_shot(stop)
+    };
     Actions {
         pause: one_shot(pause),
-        stop: one_shot(stop),
+        stop: pilot_stop,
         stop_now,
         resume: one_shot(resume),
         approve,
@@ -808,6 +826,9 @@ fn tasks(st: &RunState) -> Vec<TaskView> {
                 state,
                 commit: done.map(|d| d.commit.clone()),
                 gate_log: done.map(|d| clean(&d.gate_log, false)),
+                changed: done
+                    .map(|d| d.changed.iter().map(|p| clean(p, false)).collect())
+                    .unwrap_or_default(),
             }
         })
         .collect()
@@ -1198,5 +1219,57 @@ mod tests {
     fn clean_strips_terminal_controls() {
         assert_eq!(clean("a\u{1b}[2Jb\nc", false), "a\u{fffd}[2Jb\u{fffd}c");
         assert_eq!(clean("a\nb\tc\u{7}", true), "a\nb\tc\u{fffd}");
+    }
+
+    #[test]
+    fn multi_task_pilot_allows_boundary_stop_while_single_task_does_not() {
+        let mk = |n: usize| {
+            let tasks = (1..=n)
+                .map(|i| serial::Task {
+                    id: format!("t{i}"),
+                    prompt: format!("ok|src/{i}.txt|x"),
+                    scopes: vec![format!("src/{i}.txt")],
+                })
+                .collect();
+            Loaded::Serial(serial::RunState {
+                schema_version: 1,
+                run_id: "p1".into(),
+                policy: serial::Policy {
+                    manifest_version: serial::MANIFEST_VERSION,
+                    repo: PathBuf::from("/tmp/repo"),
+                    worker: serial::Cmd {
+                        argv: vec!["/bin/true".into()],
+                        timeout_secs: Some(30),
+                        watchdog: None,
+                    },
+                    gate: serial::Cmd {
+                        argv: vec!["/bin/true".into()],
+                        timeout_secs: Some(30),
+                        watchdog: None,
+                    },
+                    tasks,
+                    worktree: None,
+                },
+                phase: RunPhase::Idle,
+                next_task: 0,
+                done: Vec::new(),
+                intent: None,
+                failure: None,
+                updated_at_unix: 0,
+                pilot: true,
+                worktree: None,
+            })
+        };
+        let one = actions(&mk(1), true, &[], false);
+        assert!(!one.pause.available);
+        assert!(!one.stop.available);
+        assert!(one.stop_now.available);
+        assert!(!one.resume.available);
+
+        let two = actions(&mk(2), true, &[], false);
+        assert!(!two.pause.available);
+        assert!(two.stop.available);
+        assert!(two.stop_now.available);
+        assert!(!two.resume.available);
     }
 }

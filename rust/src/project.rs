@@ -108,9 +108,18 @@ impl Registry {
                     json!({ "id": e.id, "label": e.label, "eligible": false, "reason": UNUSABLE });
                 let Ok(p) = template(root, e) else { return v };
                 let (w, wd) = (&p.worker, p.worker.watchdog.as_ref());
-                v["scopes"] = json!(p.tasks[0].scopes);
+                let mut scopes = Vec::new();
+                for t in &p.tasks {
+                    for s in &t.scopes {
+                        if !scopes.contains(s) {
+                            scopes.push(s.clone());
+                        }
+                    }
+                }
+                v["scopes"] = json!(scopes);
+                v["worktree"] = json!(p.worktree.is_some());
                 v["budget"] = json!({
-                    "tasks": 1,
+                    "tasks": p.tasks.len(),
                     "worker_timeout_secs": w.timeout_secs,
                     "worker_startup_secs": wd.map(|d| d.startup_secs),
                     "worker_idle_secs": wd.map(|d| d.idle_secs),
@@ -179,7 +188,7 @@ impl Registry {
 }
 
 /// The template through the TUI's pilot guards (private file, explicit root, no repo/root
-/// overlap), outside its own repo, with exactly one task; `repo` canonical. Detail goes to stderr.
+/// overlap), outside its own repo, with 1-16 tasks; `repo` canonical. Detail goes to stderr.
 fn template(root: &Path, e: &Entry) -> Result<Policy> {
     let bad = |why: String| {
         eprintln!(
@@ -197,15 +206,57 @@ fn template(root: &Path, e: &Entry) -> Result<Policy> {
     if manifest.starts_with(&repo) {
         return Err(bad("manifest lives inside its repository".into()));
     }
-    if policy.tasks.len() != 1 {
-        return Err(bad("a launch template must have exactly one task".into()));
+    if policy.tasks.is_empty() || policy.tasks.len() > serial::MAX_PILOT_TASKS {
+        return Err(bad(format!(
+            "a launch template must have 1-{} tasks",
+            serial::MAX_PILOT_TASKS
+        )));
     }
-    if let Some(s) = policy.tasks[0]
-        .scopes
+    if let Some(s) = policy
+        .tasks
         .iter()
+        .flat_map(|t| t.scopes.iter())
         .find(|s| check_scope(s).is_err())
     {
         return Err(bad(format!("unsafe scope {s:?}")));
+    }
+    if let Some(wt) = &policy.worktree {
+        if !state::private_dir(&wt.root).unwrap_or(false) {
+            return Err(bad(
+                "worktree.root must be an existing private (0700) directory".into(),
+            ));
+        }
+        let wt_root = fs::canonicalize(&wt.root).map_err(|x| bad(format!("worktree.root: {x}")))?;
+        let state_root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+        if !state::private_dir(&wt_root).unwrap_or(false)
+            || wt_root.starts_with(&repo)
+            || repo.starts_with(&wt_root)
+            || wt_root.starts_with(&state_root)
+            || state_root.starts_with(&wt_root)
+        {
+            return Err(bad(
+                "worktree.root must be a private directory outside the repo and state root".into(),
+            ));
+        }
+        if let Some(wd) = &policy.worker.watchdog {
+            let pf = fs::canonicalize(&wd.progress_file).unwrap_or_else(|_| {
+                wd.progress_file
+                    .parent()
+                    .and_then(|p| fs::canonicalize(p).ok())
+                    .map_or_else(
+                        || wd.progress_file.clone(),
+                        |p| match wd.progress_file.file_name() {
+                            Some(n) => p.join(n),
+                            None => p,
+                        },
+                    )
+            });
+            if pf.starts_with(&wt_root) || wt_root.starts_with(&pf) {
+                return Err(bad(
+                    "worktree.root must not overlap worker.watchdog.progress_file".into(),
+                ));
+            }
+        }
     }
     policy.repo = repo;
     Ok(policy)
@@ -372,6 +423,17 @@ fn checkout_ready(p: &Policy) -> std::result::Result<(), &'static str> {
         "git_hidden" => "the checkout hides changes (assume-unchanged or skip-worktree)",
         _ => "the checkout is not ready",
     })?;
+    if let Some(wt) = &p.worktree {
+        let ok = state::private_dir(&wt.root).unwrap_or(false)
+            && fs::canonicalize(&wt.root).is_ok_and(|r| {
+                state::private_dir(&r).unwrap_or(false)
+                    && !r.starts_with(&p.repo)
+                    && !p.repo.starts_with(&r)
+            });
+        if !ok {
+            return Err("the isolated worktree directory is not ready");
+        }
+    }
     if let Some(w) = &p.worker.watchdog
         && !match w.writer_gid {
             Some(gid) => Progress::open_shared(&w.progress_file, &p.repo, gid),

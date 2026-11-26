@@ -481,12 +481,22 @@ class TestLaunch(EdgeCase):
                {**OPTIONS, "projects": [{"id": "../x", "label": "x", "eligible": False}]},
                {**OPTIONS, "projects": [{**OPTIONS["projects"][0], "scopes": [{"a": 1}]}]},
                {**OPTIONS, "projects": [{**OPTIONS["projects"][0], "budget": {"tasks": 1}}]},
+               {**OPTIONS, "projects": [{**OPTIONS["projects"][0], "worktree": "yes"}]},
                {**OPTIONS, "projects": [{**OPTIONS["projects"][0], "revision": "x"}]},
                {**OPTIONS, "projects": [{"id": "a", "label": "a", "eligible": True}]})
         for body in bad:
             Backend.routes[("GET", self.O)] = (200, "application/json", json.dumps(body).encode(), {})
             s, _, d = self.call("GET", self.O, self.session_headers())
             self.assertEqual((s, typed(d)), (502, "upstream_error"), body)
+        # Multi-task, watchdog-only, and isolated-worktree options pass through cleanly.
+        multi = {**OPTIONS, "projects": [{
+            **OPTIONS["projects"][0],
+            "worktree": True,
+            "budget": {"tasks": 4, "worker_timeout_secs": None, "worker_startup_secs": 600, "worker_idle_secs": 300, "gate_timeout_secs": 600},
+        }]}
+        Backend.routes[("GET", self.O)] = (200, "application/json", json.dumps(multi).encode(), {})
+        s, _, d = self.call("GET", self.O, self.session_headers())
+        self.assertEqual((s, json.loads(d)), (200, multi))
         for raw in (b"[" * 5000, b"x", b"\xff"):
             Backend.routes[("GET", self.O)] = (200, "application/json", raw, {})
             self.assertEqual(self.call("GET", self.O, self.session_headers())[0], 502)

@@ -126,6 +126,7 @@ LAUNCH_STATUSES = (202, 400, 404, 409, 504)
 REASONS = frozenset({"the project template is not usable", "the checkout has uncommitted changes",
                      "the checkout is not on a branch", "a Git operation is in progress in the checkout",
                      "the checkout hides changes (assume-unchanged or skip-worktree)", "the checkout is not ready",
+                     "the isolated worktree directory is not ready",
                      "the worker progress file is not fresh or usable", "the one-shot launch was already used",
                      "the one-shot claim could not be checked"})
 # Every launch error body is {"error":{"kind","message"}} with THESE messages: backend text is never relayed
@@ -373,6 +374,10 @@ def clean_options(raw):
         reason = p.get("reason")
         if isinstance(reason, str):
             q["reason"] = reason if reason in REASONS else LAUNCH_MSG["ineligible"]
+        if "worktree" in p:
+            if type(p["worktree"]) is not bool:
+                return None
+            q["worktree"] = p["worktree"]
         if "revision" in p:
             sc, bd, rev = p.get("scopes"), p.get("budget"), p["revision"]
             if not (isinstance(sc, list) and all(isinstance(x, str) for x in sc) and isinstance(bd, dict)
