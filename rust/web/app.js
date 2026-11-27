@@ -362,7 +362,7 @@ function runRow(r) {
   a.href = `#/run/${enc(r.run_id)}`;
   a.dataset.fk = r.run_id;
   if (r.run_id === state.selected) a.setAttribute("aria-current", "true");
-  const head = el("span", "run-id", r.project || r.run_id);
+  const head = el("span", "run-id", r.repo_label || r.run_id);
   const badges = el("span", "run-badges");
   badges.append(phaseBadge(r));
   if (r.owner_lost) badges.append(badge("owner lost", "lost"));
@@ -371,7 +371,7 @@ function runRow(r) {
   else meta.append(el("span", null, words(r.kind)));
   if (r.active_task) meta.append(el("span", null, r.active_task));
   if (r.updated_at_unix) meta.append(el("span", null, ago(r.updated_at_unix)));
-  if (r.project) meta.append(el("span", null, r.run_id.slice(-10)));
+  if (r.repo_label) meta.append(el("span", null, r.run_id.slice(-10)));
   if (r.owner_lost && r.lease) meta.append(el("span", null, `lease ${leaseText(r.lease)}`));
   if (r.pending_controls && r.pending_controls.length) meta.append(el("span", null, `pending ${r.pending_controls.join(", ")}`));
   a.append(head, badges, meta);
@@ -408,9 +408,9 @@ function applyDetail(v) {
   const first = $("detail").hidden;
   $("detail").hidden = false;
 
-  $("detail-title").textContent = v.project || v.run_id;
+  $("detail-title").textContent = v.repo_label || v.run_id;
   const subParts = [];
-  if (v.project) subParts.push(v.run_id);
+  if (v.repo_label) subParts.push(v.run_id);
   if (v.branch) subParts.push(`branch ${v.branch}`);
   if (v.updated_at_unix) subParts.push(`updated ${ago(v.updated_at_unix)}`);
   const sub = $("d-sub");

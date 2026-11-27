@@ -145,7 +145,7 @@ pub struct RunSummary {
     pub problem: Option<String>,
     /// Short project/checkout label derived from the repo path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub project: Option<String>,
+    pub repo_label: Option<String>,
     /// Task id currently running, paused on, or failed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_task: Option<String>,
@@ -789,7 +789,7 @@ fn invalid_summary(id: &str, e: &Error) -> RunSummary {
         failure: None,
         pending_controls: Vec::new(),
         problem: Some(clean(&e.to_string(), false)),
-        project: None,
+        repo_label: None,
         active_task: None,
         updated_at_unix: None,
     }
@@ -881,7 +881,7 @@ fn summarize(id: &str, dir: &Path, ins: &Inspected) -> RunSummary {
         failure,
         pending_controls: ins.pending.clone(),
         problem: None,
-        project,
+        repo_label: project,
         active_task,
         updated_at_unix: dir_updated_unix(dir),
     }
