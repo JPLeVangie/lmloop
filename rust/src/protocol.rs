@@ -94,8 +94,64 @@ pub fn parse(stdout: &str) -> std::result::Result<Summary, String> {
 pub struct ToolEvent {
     /// Charset-limited, at most 64 bytes; the raw name is worker text.
     pub name: String,
+    /// Short sanitized target/command hint from `state.input` or `state.title` (at most 120 chars).
+    pub target: Option<String>,
+    /// Event timestamp in Unix seconds if carried by the JSON line.
+    pub at_unix: Option<u64>,
     /// Hash of `state.input` + `state.output`; `None` unless both are present.
     pub fingerprint: Option<u64>,
+}
+
+fn tool_target(state: Option<&Value>) -> Option<String> {
+    let s = state?;
+    let input = s.get("input").and_then(Value::as_object);
+    let raw = input
+        .and_then(|m| {
+            [
+                "path",
+                "filePath",
+                "file_path",
+                "command",
+                "cmd",
+                "pattern",
+                "query",
+                "url",
+            ]
+            .into_iter()
+            .find_map(|k| m.get(k).and_then(Value::as_str))
+        })
+        .or_else(|| s.get("title").and_then(Value::as_str))?;
+    let trimmed = raw
+        .trim()
+        .strip_prefix("/work/site/")
+        .or_else(|| raw.trim().strip_prefix("/work/"))
+        .unwrap_or_else(|| raw.trim());
+    let mut out = String::new();
+    let mut prev_ws = false;
+    let mut chars = 0usize;
+    for c in trimmed.chars() {
+        let ch = if c.is_control() || c.is_whitespace() {
+            ' '
+        } else {
+            c
+        };
+        if ch == ' ' {
+            if prev_ws || out.is_empty() {
+                continue;
+            }
+            prev_ws = true;
+        } else {
+            prev_ws = false;
+        }
+        if chars == 120 {
+            out.push('…');
+            break;
+        }
+        out.push(ch);
+        chars += 1;
+    }
+    let out = out.trim().to_string();
+    if out.is_empty() { None } else { Some(out) }
 }
 
 pub fn tool_event(line: &[u8]) -> Option<ToolEvent> {
@@ -123,6 +179,11 @@ pub fn tool_event(line: &[u8]) -> Option<ToolEvent> {
         })
         .take(64)
         .collect();
+    let target = tool_target(state);
+    let at_unix = v
+        .get("timestamp")
+        .and_then(Value::as_u64)
+        .map(|ts| if ts > 10_000_000_000 { ts / 1000 } else { ts });
     let fingerprint = state
         .and_then(|s| Some((s.get("input").filter(|v| !v.is_null())?, s.get("output")?)))
         .map(|(i, o)| {
@@ -130,7 +191,12 @@ pub fn tool_event(line: &[u8]) -> Option<ToolEvent> {
             (i.to_string(), o.to_string()).hash(&mut h);
             h.finish()
         });
-    Some(ToolEvent { name, fingerprint })
+    Some(ToolEvent {
+        name,
+        target,
+        at_unix,
+        fingerprint,
+    })
 }
 
 /// The bridge wire: an external trusted writer appends the literal record `model\n` to a private
@@ -946,5 +1012,16 @@ mod tests {
         // No state at all: still a completed call (that is what the CLI emits), but nothing to compare.
         let bare = br#"{"type":"tool_use","sessionID":"s1","part":{"tool":"bash"}}"#;
         assert_eq!(tool_event(bare).unwrap().fingerprint, None);
+
+        // Human-readable target extraction strips /work/site/ prefix and normalizes ms timestamps.
+        let with_path = br#"{"type":"tool_use","timestamp":1795755704040,"sessionID":"s1","part":{"tool":"read","state":{"status":"completed","input":{"path":"/work/site/js/wallet.js"},"output":"ok"}}}"#;
+        let ev = tool_event(with_path).unwrap();
+        assert_eq!(ev.target.as_deref(), Some("js/wallet.js"));
+        assert_eq!(ev.at_unix, Some(1795755704));
+
+        let with_cmd = br#"{"type":"tool_use","timestamp":1795755705,"sessionID":"s1","part":{"tool":"shell","state":{"status":"completed","input":{"command":"node --test\n\techo ok"},"output":"ok"}}}"#;
+        let ev2 = tool_event(with_cmd).unwrap();
+        assert_eq!(ev2.target.as_deref(), Some("node --test echo ok"));
+        assert_eq!(ev2.at_unix, Some(1795755705));
     }
 }

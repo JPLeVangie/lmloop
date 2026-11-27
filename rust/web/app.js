@@ -54,6 +54,14 @@ function ago(unix) {
   if (s < 172800) return `${Math.round(s / 3600)}h ago`;
   return `${Math.round(s / 86400)}d ago`;
 }
+function duration(secs) {
+  const s = Math.max(0, Math.floor(secs || 0));
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m ${pad(s % 60)}s`;
+  const h = Math.floor(m / 60);
+  return `${h}h ${pad(m % 60)}m`;
+}
 function bytesLabel(n) {
   if (n < 1024) return `${n} B`;
   if (n < 1048576) return `${(n / 1024).toFixed(1)} KiB`;
@@ -336,9 +344,10 @@ function applyList(runs) {
 // by itself: serial runs stay in worker/gate/committing, and a diagnostic gate whose owner died is
 // already reported by the server as the terminal `interrupted`. Unknown phases are not claimed active.
 const ACTIVE_PHASES = new Set(["idle", "worker", "gate", "committing", "paused", "gate_running"]);
+const RUNNING_PHASES = new Set(["worker", "gate", "committing", "gate_running"]);
 const RUN_GROUPS = [
-  { key: "active", title: "Active", note: "Unfinished runs, including paused ones and any whose owner is lost." },
-  { key: "history", title: "History", note: "Complete, failed, stopped, interrupted, unreadable or unrecognised." },
+  { key: "active", title: "Active" },
+  { key: "history", title: "History" },
 ];
 /** Split by phase only, keeping the server's newest-first order inside each group. */
 function groupRuns(runs) {
@@ -353,15 +362,17 @@ function runRow(r) {
   a.href = `#/run/${enc(r.run_id)}`;
   a.dataset.fk = r.run_id;
   if (r.run_id === state.selected) a.setAttribute("aria-current", "true");
-  const head = el("span", "run-id", r.run_id);
+  const head = el("span", "run-id", r.project || r.run_id);
   const badges = el("span", "run-badges");
   badges.append(phaseBadge(r));
   if (r.owner_lost) badges.append(badge("owner lost", "lost"));
   const meta = el("span", "run-meta");
-  meta.append(
-    el("span", null, r.kind.startsWith("serial_") ? `${r.tasks_done}/${r.tasks_total} tasks` : words(r.kind)),
-    el("span", null, `lease ${leaseText(r.lease)}`),
-  );
+  if (r.kind.startsWith("serial_")) meta.append(el("span", null, `${r.tasks_done}/${r.tasks_total} tasks`));
+  else meta.append(el("span", null, words(r.kind)));
+  if (r.active_task) meta.append(el("span", null, r.active_task));
+  if (r.updated_at_unix) meta.append(el("span", null, ago(r.updated_at_unix)));
+  if (r.project) meta.append(el("span", null, r.run_id.slice(-10)));
+  if (r.owner_lost && r.lease) meta.append(el("span", null, `lease ${leaseText(r.lease)}`));
   if (r.pending_controls && r.pending_controls.length) meta.append(el("span", null, `pending ${r.pending_controls.join(", ")}`));
   a.append(head, badges, meta);
   if (r.failure || r.problem) a.append(el("span", "run-fail", r.failure || r.problem));
@@ -384,7 +395,7 @@ function renderRuns() {
       h.append(el("span", "tally", String(groups[g.key].length)));
       const ul = el("ul", "runs");
       ul.append(...groups[g.key].map(runRow));
-      sec.append(h, el("p", "note", g.note), ul);
+      sec.append(h, ul);
       return sec;
     });
   });
@@ -397,21 +408,27 @@ function applyDetail(v) {
   const first = $("detail").hidden;
   $("detail").hidden = false;
 
-  $("detail-title").textContent = v.run_id;
-  $("d-kind").textContent = KIND[v.kind] || words(v.kind);
-  $("d-updated").textContent = `Fetched ${clock(Math.floor(Date.now() / 1000))}`;
+  $("detail-title").textContent = v.project || v.run_id;
+  const subParts = [];
+  if (v.project) subParts.push(v.run_id);
+  if (v.branch) subParts.push(`branch ${v.branch}`);
+  if (v.updated_at_unix) subParts.push(`updated ${ago(v.updated_at_unix)}`);
+  const sub = $("d-sub");
+  sub.hidden = !subParts.length;
+  sub.textContent = subParts.join(" · ");
 
   const ph = $("d-phase");
-  const sig = JSON.stringify([v.phase, v.owner_lost, v.pending_controls]);
+  const sig = JSON.stringify([v.phase, v.owner_lost, v.pending_controls, v.decision && v.decision.decision]);
   rebuild(ph, sig, () => {
     const out = [phaseBadge(v)];
     if (v.owner_lost) out.push(badge("owner lost", "lost"));
+    if (v.decision) out.push(badge(words(v.decision.decision), v.decision.decision === "approved" ? "ok" : "warn"));
     for (const c of v.pending_controls || []) out.push(badge(`${c} pending`, "warn"));
     return out;
   });
 
   const total = v.tasks_total || 0;
-  $("d-progress").closest(".prog-row").hidden = total === 0;
+  $("d-prog-row").hidden = total === 0;
   $("d-progress").max = Math.max(1, total);
   $("d-progress").value = v.tasks_done || 0;
   $("d-progress-text").textContent = `${v.tasks_done} of ${total} tasks committed`;
@@ -425,7 +442,9 @@ function applyDetail(v) {
   rebuild($("d-warnings"), JSON.stringify(warns), () => warns.map((w) => el("li", null, w)));
 
   renderActions(v);
+  renderActivity(v);
   renderTasks(v);
+  renderHandoff(v);
   renderFacts(v);
   renderLogs(v);
   renderEvents(v);
@@ -437,6 +456,113 @@ function applyDetail(v) {
   } else if (first && !document.activeElement.closest?.("main, aside")) {
     /* leave focus alone on background renders */
   }
+}
+
+function activityHeadline(v) {
+  const t = v.active_task || (v.watchdog && v.watchdog.task) || "";
+  if (v.owner_lost) return t ? `Worker exited during ${t}` : "Worker exited unexpectedly";
+  if (v.phase === "worker") return t ? `Working on ${t}` : "Worker running";
+  if (v.phase === "gate" || v.phase === "gate_running") return t ? `Running verification gate on ${t}` : "Running verification gate";
+  if (v.phase === "committing") return t ? `Committing ${t}` : "Committing changes";
+  if (v.phase === "complete") return v.tasks_total ? `Completed all ${v.tasks_total} tasks` : "Run complete";
+  if (v.phase === "failed") return t ? `Failed on ${t}` : "Run failed";
+  if (v.phase === "paused") return t ? `Paused before ${t}` : "Paused";
+  if (v.phase === "stopped") return v.tasks_total ? `Stopped (${v.tasks_done} of ${v.tasks_total} tasks done)` : "Stopped";
+  if (v.phase === "interrupted") return "Interrupted";
+  return words(v.phase);
+}
+
+function activityMode(v) {
+  if (v.owner_lost) return "bad";
+  return phaseClass(v.phase);
+}
+
+function tickLive() {
+  const v = state.view;
+  if (!v || $("detail").hidden || document.hidden) return;
+  const live = RUNNING_PHASES.has(v.phase) && !v.owner_lost;
+  const w = v.watchdog;
+  const now = Math.floor(Date.now() / 1000);
+  const start = v.task_started_unix || (w && w.started_unix) || 0;
+  const elBox = $("act-elapsed");
+  if (live && start) {
+    elBox.textContent = duration(now - start);
+  } else if (w && w.started_unix && w.updated_at_unix && w.updated_at_unix >= w.started_unix) {
+    elBox.textContent = duration(w.updated_at_unix - w.started_unix);
+  } else {
+    elBox.textContent = "";
+  }
+  const hb = $("act-heartbeat");
+  if (!w) {
+    if (live && start) {
+      hb.hidden = false;
+      hb.dataset.stale = "false";
+      hb.textContent = `Running for ${duration(now - start)}`;
+    } else {
+      hb.hidden = true;
+    }
+    return;
+  }
+  hb.hidden = false;
+  const parts = [];
+  let stale = false;
+  if (live) {
+    if (w.last_pulse_unix) {
+      const age = Math.max(0, now - w.last_pulse_unix);
+      stale = age > 60 || !!w.warning;
+      parts.push(`Last model activity ${age}s ago`);
+    } else if (w.started_unix) {
+      const wait = Math.max(0, now - w.started_unix);
+      stale = wait > 60 || !!w.warning;
+      parts.push(`Waiting for model response (${duration(wait)})`);
+    }
+  } else if (w.last_pulse_unix) {
+    parts.push(`Last activity ${ago(w.last_pulse_unix)}`);
+  }
+  if (w.model_pulses) parts.push(`${w.model_pulses} pulse${w.model_pulses === 1 ? "" : "s"}`);
+  if (w.tools_completed) parts.push(`${w.tools_completed} tool${w.tools_completed === 1 ? "" : "s"}`);
+  if (w.warning) parts.push(w.warning);
+  if (w.trip) parts.push(`Tripped: ${w.trip}`);
+  hb.dataset.stale = String(stale);
+  hb.textContent = parts.join(" · ");
+}
+
+function renderActivity(v) {
+  const card = $("activity-card");
+  card.hidden = false;
+  card.dataset.mode = activityMode(v);
+  $("act-h").textContent = activityHeadline(v);
+  tickLive();
+
+  const items = (v.activity || []).slice().reverse();
+  const feed = $("act-feed");
+  const empty = $("act-empty");
+  feed.hidden = items.length === 0;
+  if (items.length) {
+    empty.hidden = true;
+    rebuild(feed, JSON.stringify(items), () =>
+      items.map((it) => {
+        const li = el("li");
+        li.append(
+          el("span", "af-time", it.at_unix ? clock(it.at_unix) : ""),
+          el("span", "af-tool", `→ ${it.tool}`),
+          el("span", "af-target", it.target || ""),
+        );
+        return li;
+      }),
+    );
+  } else {
+    const live = RUNNING_PHASES.has(v.phase) && !v.owner_lost;
+    empty.hidden = !live;
+    empty.textContent = live ? "No completed tool calls yet — waiting for the worker's first action." : "";
+  }
+}
+
+function renderHandoff(v) {
+  const box = $("sec-handoff");
+  const text = v.handoff || "";
+  box.hidden = !text;
+  if (text) $("d-handoff").textContent = text;
 }
 
 const ACTIONS = ["pause", "stop", "stop_now", "resume", "approve", "request_changes"];
@@ -457,18 +583,21 @@ function actionInfo(v, a) {
 }
 
 function renderActions(v) {
+  let shown = 0;
   for (const a of ACTIONS) {
     const btn = document.querySelector(`[data-action="${a}"]`);
     const info = actionInfo(v, a);
     const busy = busyFor(v.run_id, a);
+    const visible = info.available || busy;
+    btn.hidden = !visible;
+    if (!visible) continue;
+    shown++;
     const usable = info.available && !busy;
     btn.setAttribute("aria-disabled", usable ? "false" : "true");
-    btn.setAttribute("aria-describedby", `why-${a}`);
+    btn.title = info.reason || "";
     if (busy) btn.setAttribute("aria-busy", "true");
     else btn.removeAttribute("aria-busy");
     btn.textContent = busy ? BUSY_LABEL[a] : LABEL[a];
-    btn.closest(".act").dataset.ok = String(usable);
-    $(`why-${a}`).textContent = busy ? "Request in flight." : info.available ? `Will: ${info.reason}` : `Unavailable: ${info.reason}`;
   }
   const mine = [...state.inflight.keys()].filter((k) => k.startsWith(`${v.run_id}:`)).map((k) => k.split(":")[1]);
   const b = $("act-busy");
@@ -478,13 +607,16 @@ function renderActions(v) {
       ? "Resume request is open until the resumed run ends. The page keeps polling and Pause, Stop and Stop now stay available while the server reports them as available."
       : `Sending ${mine.map((m) => LABEL[m]).join(", ")}…`;
   }
+  const hasFlash = state.flashes.has(v.run_id);
+  $("acts-wrap").hidden = shown === 0 && !mine.length && !hasFlash;
 }
 
 function renderTasks(v) {
   const tasks = v.tasks || [];
+  $("sec-tasks").hidden = tasks.length === 0 && v.kind === "diagnostic_gate";
   $("tasks-empty").hidden = tasks.length > 0;
   $("tasks").hidden = tasks.length === 0;
-  $("tasks-note").textContent = tasks.length ? `${v.tasks_done} of ${tasks.length} committed` : "";
+  $("tasks-note").textContent = tasks.length ? `${v.tasks_done}/${tasks.length} done` : "";
   rebuild($("tasks"), JSON.stringify(tasks), () =>
     tasks.map((t, i) => {
       const li = el("li", "task");
@@ -495,15 +627,23 @@ function renderTasks(v) {
       id.append(pip, document.createTextNode(t.id));
       const sb = badge(words(t.state), t.state === "committed" ? "ok" : t.state === "running" ? "live" : t.state === "failed" ? "bad" : "neutral");
       const sub = el("span", "task-sub");
-      const files = Array.isArray(t.changed) && t.changed.length ? ` · ${t.changed.length} file${t.changed.length === 1 ? "" : "s"}` : "";
-      sub.append(el("span", null, t.commit ? `commit ${t.commit.slice(0, 12)}${files}` : "no commit"));
+      if (t.commit) {
+        const changed = Array.isArray(t.changed) ? t.changed : [];
+        const preview = changed.length
+          ? ` · ${changed.slice(0, 3).join(", ")}${changed.length > 3 ? ` +${changed.length - 3}` : ""}`
+          : "";
+        sub.append(el("span", "task-files", `${t.commit.slice(0, 8)}${preview}`));
+      } else {
+        sub.append(el("span", null, t.state === "running" ? "in progress" : t.state === "pending" ? "queued" : "no commit"));
+      }
       if (t.gate_log) {
-        const b = el("button", "linkbtn", "Open gate log");
+        const b = el("button", "linkbtn", "Gate log");
         b.type = "button";
         b.dataset.fk = `gate:${t.id}`;
         b.addEventListener("click", () => {
+          $("drawer-logs").open = true;
           selectLog(t.gate_log.replace(/^logs\//, ""));
-          $("log-text").scrollIntoView({ block: "nearest" });
+          $("drawer-logs").scrollIntoView({ block: "nearest" });
         });
         sub.append(b);
       }
@@ -539,8 +679,9 @@ function watchdogRows(w) {
 
 function renderFacts(v) {
   const dec = v.decision;
+  $("tech-tally").textContent = dec ? words(dec.decision) : words(v.kind);
   const rows = [
-    ["Objective", v.objective ? String(v.objective) : "Not exposed by the operator API in this milestone.", !v.objective],
+    ["Run ID", v.run_id],
     ["Phase", words(v.phase)],
     ["Kind", KIND[v.kind] || words(v.kind)],
     ...(v.branch ? [["Worktree branch", v.branch]] : []),
@@ -569,6 +710,7 @@ function renderFacts(v) {
 
 function renderEvents(v) {
   const evs = (v.events || []).slice().reverse();
+  $("events-tally").textContent = `${evs.length} event${evs.length === 1 ? "" : "s"}`;
   rebuild($("events"), JSON.stringify(evs.map((e) => [e.seq, e.kind, e.data])), () => {
     if (!evs.length) return [el("li", "term-empty", "No events recorded for this run.")];
     return evs.map((e) => {
@@ -588,6 +730,7 @@ function renderEvents(v) {
 /* ───── logs ───── */
 function renderLogs(v) {
   const names = (v.logs || []).slice().reverse();
+  $("logs-tally").textContent = `${names.length} file${names.length === 1 ? "" : "s"}`;
   $("logs-empty").hidden = names.length > 0;
   $("log-chips").hidden = names.length === 0;
   let sel = state.log && state.log.name;
@@ -615,12 +758,12 @@ function renderLogs(v) {
     $("log-info").textContent = names.length ? "Select a log file to read its tail." : "";
     $("log-text").hidden = true;
   }
-  // Follow a live log: reload quietly when the run's own progress moved.
+  // Follow a live log only when the raw-logs drawer is actually open.
   const last = (v.events || []).at(-1);
   const stamp2 = `${v.phase}|${last ? last.seq : 0}|${names.length}`;
   if (sel && state.log.stamp !== stamp2) {
     state.log.stamp = stamp2;
-    if (state.log.loaded) loadLog(sel, true);
+    if (state.log.loaded && $("drawer-logs").open) loadLog(sel, true);
   } else if (sel && !state.log.stamp) {
     state.log.stamp = stamp2;
   }
@@ -747,7 +890,10 @@ function renderFlash() {
   const f = state.flashes.get(state.selected);
   $("act-ok").hidden = !(f && f.kind === "ok");
   $("act-err").hidden = !(f && f.kind === "bad");
-  if (f) $(f.kind === "ok" ? "act-ok" : "act-err").textContent = `${clock(f.at)} · ${f.text}`;
+  if (f) {
+    $(f.kind === "ok" ? "act-ok" : "act-err").textContent = `${clock(f.at)} · ${f.text}`;
+    $("acts-wrap").hidden = false;
+  }
 }
 
 function request(id, action, note) {
@@ -1183,6 +1329,12 @@ $("dlg").addEventListener("close", () => {
 $("dlg-note").addEventListener("input", syncDialog);
 $("dlg-ack").addEventListener("change", syncDialog);
 
+$("drawer-logs").addEventListener("toggle", () => {
+  if (!$("drawer-logs").open) return;
+  const names = (state.view && state.view.logs) || [];
+  if (!state.log && names.length) selectLog(names[names.length - 1]);
+  else if (state.log) loadLog(state.log.name, true);
+});
 $("log-bytes").addEventListener("change", () => state.log && loadLog(state.log.name, false));
 $("log-reload").addEventListener("click", (ev) => {
   if (ev.currentTarget.getAttribute("aria-disabled") === "true" || !state.log) return;
@@ -1191,9 +1343,14 @@ $("log-reload").addEventListener("click", (ev) => {
 $("refresh").addEventListener("click", () => refresh());
 addEventListener("hashchange", () => route(true));
 document.addEventListener("visibilitychange", () => {
-  if (!document.hidden) refresh();
-  else clearTimeout(state.timer);
+  if (!document.hidden) {
+    tickLive();
+    refresh();
+  } else {
+    clearTimeout(state.timer);
+  }
 });
+if (typeof setInterval === "function") setInterval(tickLive, 1000);
 
 renderSync("loading");
 setState("runs-state", "loading", "Loading runs…");

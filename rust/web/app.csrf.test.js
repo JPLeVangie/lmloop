@@ -448,7 +448,7 @@ test("run list renders labelled groups, truthful badges, and keeps focus keys ac
   t.renderRuns();
   const groups = box.kids;
   assert.deepEqual(groups.map((x) => x.kids[0].textContent), ["Active2", "History1"]);
-  const rows = (grp) => grp.kids[2].kids.map((li) => li.kids[0]);
+  const rows = (grp) => grp.kids[1].kids.map((li) => li.kids[0]);
   assert.deepEqual(rows(groups[0]).map((a) => a.dataset.fk), ["p1", "l1"]);
   assert.deepEqual(rows(groups[1]).map((a) => a.dataset.fk), ["h1"]);
   const [, lostRow] = rows(groups[0]);

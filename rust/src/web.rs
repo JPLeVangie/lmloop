@@ -814,6 +814,9 @@ mod tests {
             failure: failure.map(Into::into),
             pending_controls: ctl.iter().map(|c| c.to_string()).collect(),
             problem: None,
+            project: None,
+            active_task: None,
+            updated_at_unix: None,
         }
     }
 

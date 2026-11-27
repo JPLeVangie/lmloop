@@ -143,6 +143,15 @@ pub struct RunSummary {
     /// Control files waiting for the owner: PAUSE, STOP, STOP-NOW.
     pub pending_controls: Vec<String>,
     pub problem: Option<String>,
+    /// Short project/checkout label derived from the repo path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
+    /// Task id currently running, paused on, or failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_task: Option<String>,
+    /// Most recent persisted state/watchdog timestamp (Unix seconds).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at_unix: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -192,6 +201,15 @@ pub struct RunView {
     pub events: Vec<EventView>,
     /// Latest worker-watchdog evidence (kept after a failure), if the run used one.
     pub watchdog: Option<serial::WatchdogEvidence>,
+    /// Recent human-readable completed tool actions (live from watchdog or parsed from newest log).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub activity: Vec<serial::ActivityItem>,
+    /// Committed-task handoff summary (`handoff.md`), if present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handoff: Option<String>,
+    /// Start timestamp (Unix seconds) of the current or latest task.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_started_unix: Option<u64>,
     /// Isolated Git worktree branch name, if this run executed in an isolated worktree.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
@@ -285,8 +303,8 @@ impl Operator {
         Ok(found
             .into_iter()
             .filter_map(|(_, id)| match (self.inspect_run(&id), repo) {
-                (Ok((_, ins)), None) => Some(summarize(&id, &ins)),
-                (Ok((_, ins)), Some(r)) => match &ins.loaded {
+                (Ok((dir, ins)), None) => Some(summarize(&id, &dir, &ins)),
+                (Ok((dir, ins)), Some(r)) => match &ins.loaded {
                     Loaded::Serial(st)
                         if fs::canonicalize(&st.policy.repo).is_ok_and(|c| c == r)
                             || st
@@ -295,7 +313,7 @@ impl Operator {
                                 .and_then(|w| fs::canonicalize(&w.path).ok())
                                 .is_some_and(|c| c == r) =>
                     {
-                        Some(summarize(&id, &ins))
+                        Some(summarize(&id, &dir, &ins))
                     }
                     _ => None,
                 },
@@ -323,6 +341,15 @@ impl Operator {
             warnings.push(clean(&e.to_string(), false));
             None
         });
+        let activity = recent_activity(&dir, &logs, watchdog.as_ref());
+        let handoff = read_handoff(&dir);
+        let task_started_unix = watchdog.as_ref().map(|w| w.started_unix).or_else(|| {
+            events
+                .iter()
+                .rev()
+                .find(|e| e.kind == "task_started")
+                .map(|e| e.at_unix)
+        });
         let (tasks, complete, evidence, branch) = match &ins.loaded {
             Loaded::Serial(st) => (
                 tasks(st),
@@ -337,7 +364,7 @@ impl Operator {
             Loaded::Diagnostic(_) => (Vec::new(), false, state::EVIDENCE, None),
         };
         Ok(RunView {
-            summary: summarize(&id, &ins),
+            summary: summarize(&id, &dir, &ins),
             actions: ins.actions,
             tasks,
             complete,
@@ -346,6 +373,9 @@ impl Operator {
             logs,
             events,
             watchdog,
+            activity,
+            handoff,
+            task_started_unix,
             branch,
             warnings,
         })
@@ -759,24 +789,73 @@ fn invalid_summary(id: &str, e: &Error) -> RunSummary {
         failure: None,
         pending_controls: Vec::new(),
         problem: Some(clean(&e.to_string(), false)),
+        project: None,
+        active_task: None,
+        updated_at_unix: None,
     }
 }
 
-fn summarize(id: &str, ins: &Inspected) -> RunSummary {
-    let (kind, phase, done, total, failure) = match &ins.loaded {
-        Loaded::Serial(st) => (
-            if st.pilot {
-                RunKind::SerialPilot
+fn project_label(repo: &Path) -> Option<String> {
+    let leaf = repo.file_name().and_then(|s| s.to_str())?;
+    let chosen = if leaf == "site" {
+        repo.parent()
+            .and_then(|p| p.file_name())
+            .and_then(|s| s.to_str())
+            .unwrap_or(leaf)
+    } else {
+        leaf
+    };
+    let s = clean(chosen, false);
+    if s.is_empty() { None } else { Some(s) }
+}
+
+fn dir_updated_unix(dir: &Path) -> Option<u64> {
+    ["watchdog.json", "run.json", "events.jsonl", ""]
+        .into_iter()
+        .filter_map(|name| {
+            let p = if name.is_empty() {
+                dir.to_path_buf()
             } else {
-                RunKind::SerialFixture
-            },
-            snake(&st.phase),
-            st.done.len(),
-            st.policy.tasks.len(),
-            st.failure
-                .as_ref()
-                .map(|f| clean(&format!("{}: {} ({})", f.task, f.reason, f.detail), false)),
-        ),
+                dir.join(name)
+            };
+            fs::symlink_metadata(p)
+                .ok()?
+                .modified()
+                .ok()?
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()
+                .map(|d| d.as_secs())
+        })
+        .max()
+}
+
+fn summarize(id: &str, dir: &Path, ins: &Inspected) -> RunSummary {
+    let (kind, phase, done, total, failure, project, active_task) = match &ins.loaded {
+        Loaded::Serial(st) => {
+            let active = if st.phase != RunPhase::Complete {
+                st.policy
+                    .tasks
+                    .get(st.next_task)
+                    .map(|t| clean(&t.id, false))
+            } else {
+                None
+            };
+            (
+                if st.pilot {
+                    RunKind::SerialPilot
+                } else {
+                    RunKind::SerialFixture
+                },
+                snake(&st.phase),
+                st.done.len(),
+                st.policy.tasks.len(),
+                st.failure
+                    .as_ref()
+                    .map(|f| clean(&format!("{}: {} ({})", f.task, f.reason, f.detail), false)),
+                project_label(&st.policy.repo),
+                active,
+            )
+        }
         Loaded::Diagnostic(s) => (
             RunKind::DiagnosticGate,
             if ins.owner_lost {
@@ -786,6 +865,8 @@ fn summarize(id: &str, ins: &Inspected) -> RunSummary {
             },
             0,
             0,
+            None,
+            None,
             None,
         ),
     };
@@ -800,6 +881,9 @@ fn summarize(id: &str, ins: &Inspected) -> RunSummary {
         failure,
         pending_controls: ins.pending.clone(),
         problem: None,
+        project,
+        active_task,
+        updated_at_unix: dir_updated_unix(dir),
     }
 }
 
@@ -905,6 +989,64 @@ fn recent_events(dir: &Path) -> Result<Vec<EventView>> {
                 .collect(),
         })
         .collect())
+}
+
+const ACTIVITY_LOG_BYTES: u64 = 256 * 1024;
+const ACTIVITY_MAX_ITEMS: usize = 20;
+const HANDOFF_MAX_BYTES: u64 = 16 * 1024;
+
+/// Recent completed tool calls for the run: live from `watchdog.json` when populated,
+/// falling back to scanning the tail of the newest worker log so finished/older runs
+/// also show a human-readable action feed.
+fn recent_activity(
+    dir: &Path,
+    logs: &[String],
+    watchdog: Option<&serial::WatchdogEvidence>,
+) -> Vec<serial::ActivityItem> {
+    if let Some(wd) = watchdog
+        && !wd.recent.is_empty()
+    {
+        return wd.recent.clone();
+    }
+    let logs_dir = dir.join("logs");
+    if !state::private_dir(&logs_dir).unwrap_or(false) {
+        return Vec::new();
+    }
+    // Check newest logs first (a committed task writes a gate log right after its worker log).
+    for name in logs.iter().rev().take(3) {
+        let Ok(Some((bytes, size))) = tail_bytes(&logs_dir.join(name), ACTIVITY_LOG_BYTES) else {
+            continue;
+        };
+        let skip = usize::from(size > bytes.len() as u64);
+        let mut items = Vec::new();
+        for line in bytes.split(|b| *b == b'\n').skip(skip) {
+            if let Some(ev) = crate::protocol::tool_event(line) {
+                items.push(serial::ActivityItem {
+                    at_unix: ev.at_unix.unwrap_or(0),
+                    tool: ev.name,
+                    target: ev.target,
+                });
+            }
+        }
+        if !items.is_empty() {
+            if items.len() > ACTIVITY_MAX_ITEMS {
+                items.drain(..items.len() - ACTIVITY_MAX_ITEMS);
+            }
+            return items;
+        }
+    }
+    Vec::new()
+}
+
+fn read_handoff(dir: &Path) -> Option<String> {
+    let (bytes, _) = tail_bytes(&dir.join("handoff.md"), HANDOFF_MAX_BYTES).ok()??;
+    let text = clean(&String::from_utf8_lossy(&bytes), true);
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
 }
 
 fn read_decision(dir: &Path, id: &str) -> Result<Option<DecisionRecord>> {

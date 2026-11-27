@@ -30,7 +30,7 @@ ExecStart=/usr/bin/python3 %h/lmloop-rust/current/rust/edge/gateway.py \
 # Operator subs, secret references and optional device tokens; see edge.env.example.
 EnvironmentFile=%h/.config/lmloop-rust/edge.env
 Environment=PYTHONUNBUFFERED=1
-Restart=on-failure
+Restart=always
 RestartSec=5
 TimeoutStopSec=15
 UMask=0077

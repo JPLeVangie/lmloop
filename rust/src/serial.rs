@@ -849,6 +849,18 @@ fn scoped_fingerprint(repo: &Path, scopes: &[String]) -> Option<u64> {
     Some(h.finish())
 }
 
+const WATCH_RECENT_MAX: usize = 20;
+
+/// One completed tool action observed in the worker's output stream.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ActivityItem {
+    pub at_unix: u64,
+    pub tool: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+}
+
 /// The latest worker-watchdog state, persisted as `watchdog.json` (written by the lease holder,
 /// at most once a second while watching, and always at the end). It survives a failed task, so
 /// the evidence of why a worker was cut off is still there; a later task replaces it.
@@ -877,6 +889,9 @@ pub struct WatchdogEvidence {
     /// Advisory only; it never stops the worker.
     pub warning: Option<String>,
     pub trip: Option<String>,
+    /// Most recent completed tool calls for this task (oldest first, capped at 20).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recent: Vec<ActivityItem>,
 }
 
 pub fn read_watchdog(dir: &Path) -> Result<Option<WatchdogEvidence>> {
@@ -961,6 +976,7 @@ impl<'a> Dog<'a> {
                 repeat_count: 0,
                 warning: None,
                 trip: None,
+                recent: Vec::new(),
             },
             progress,
         };
@@ -1003,8 +1019,9 @@ impl<'a> Dog<'a> {
     }
 
     fn tool(&mut self, t: ToolEvent) {
+        let now = state::now_unix();
         self.ev.tools_completed += 1;
-        self.ev.last_tool_unix = Some(state::now_unix());
+        self.ev.last_tool_unix = Some(now);
         // No tool fingerprint, nothing to compare: do not touch the files at all.
         let key = t.fingerprint.and_then(|f| {
             let sf = *self
@@ -1023,6 +1040,15 @@ impl<'a> Dog<'a> {
                 "tool {:?} completed {} times in a row with the same input and result and no change to the task's scoped files; the worker may be looping (advisory only)",
                 t.name, self.ev.repeat_count
             ));
+        }
+        self.ev.recent.push(ActivityItem {
+            at_unix: t.at_unix.unwrap_or(now),
+            tool: t.name.clone(),
+            target: t.target,
+        });
+        if self.ev.recent.len() > WATCH_RECENT_MAX {
+            let drop_n = self.ev.recent.len() - WATCH_RECENT_MAX;
+            self.ev.recent.drain(..drop_n);
         }
         self.ev.last_tool = Some(t.name);
         self.dirty = true;

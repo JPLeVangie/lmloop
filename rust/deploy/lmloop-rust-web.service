@@ -20,7 +20,7 @@ EnvironmentFile=%h/.config/lmloop-rust/edge.env
 # %S/lmloop-rust, created 0700: the Rust state root insists on it.
 StateDirectory=lmloop-rust
 StateDirectoryMode=0700
-Restart=on-failure
+Restart=always
 RestartSec=5
 TimeoutStopSec=15
 UMask=0077
